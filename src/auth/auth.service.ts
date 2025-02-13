@@ -1,41 +1,53 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
 import { CreateUserDto } from 'src/user/dto/create-user.dto';
 import * as bcrypt from 'bcrypt';
 import { User } from 'src/user/entities/user.entity';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class AuthService {
-  private saltOrRounds = 10;
-
   constructor(
     private usersService: UserService,
     private jwtService: JwtService,
+    private configService: ConfigService,
   ) {}
+
+  private saltOrRounds =
+    this.configService.get<number | string>('JWT_SALT_OR_ROUNDS') || 10;
 
   async validateUser(email: string, pass: string): Promise<any> {
     const user = await this.usersService.findOneByEmail(email);
 
-    const isMatch = await bcrypt.compare(pass, user.password);
+    const isMatch = user && (await bcrypt.compare(pass, user.password));
 
-    if (user && isMatch) {
+    if (isMatch) {
       const { password, ...result } = user;
       return result;
     }
     return null;
   }
 
-  async signUp(payload: CreateUserDto) {
+  async signUp(payload: CreateUserDto): Promise<User> {
+    if (!payload) {
+      throw new Error('Invalid user data');
+    }
+
     const hashPass = await bcrypt.hash(payload.password, this.saltOrRounds);
 
-    let data = {
+    const data = {
       ...payload,
       password: hashPass,
     };
 
-    const user = await this.usersService.create(data);
-    return user;
+    try {
+      return await this.usersService.create(data);
+    } catch (error) {
+      throw new InternalServerErrorException(
+        `Failed to create user: ${error.message}`,
+      );
+    }
   }
 
   async login(user: User) {
