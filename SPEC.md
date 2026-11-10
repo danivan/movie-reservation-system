@@ -26,10 +26,10 @@ These are now part of the plan:
 | **G4. Empty PATCH body** (`{}`) | TypeORM throws `UpdateValuesMissingError` → 500 | `update` throws `BadRequestException('No fields to update')` when the DTO has no keys |
 | **G5. DB internals leak in 500 messages** (`` `Failed to ...: ${error.message}` ``) | Leaks SQL and constraint details to clients | Generic 500 message. Log the error with Nest `Logger` (no request body or PII) |
 | **G6. 409 message** | Must not echo the email | `ConflictException('Email already in use')` |
-| **G7. Timing-based enumeration** after the 404→401 fix | Unknown emails respond faster (no bcrypt work) | Compare against a dummy hash generated once with the same salt rounds |
+| **G7. Timing-based enumeration** after the 404→401 fix | Unknown emails respond faster (no bcrypt work) | Compare against a dummy hash generated once with the same salt rounds. It is started at startup (`onModuleInit`, not awaited) so the first unknown-email login isn't measurably slower (review measured 123 ms vs ~50 ms when lazy). A failed hash is not cached, so it is retried rather than turning every unknown email into a 500. **Residual (accepted, see G10):** accounts hashed at a different cost, or still holding plaintext passwords, respond at a different speed |
 | **G8. E2E harness is broken.** `test/jest-e2e.json` has no `moduleNameMapper` for `src/...` imports, and the only e2e test hits a non-existent, guarded `GET /` | The e2e red phase can't run at all | Add `"moduleNameMapper": {"^src/(.*)$": "<rootDir>/../src/$1"}` and replace the `GET /` test |
 | **G9. No way to create an admin** once register can't set `isAdmin` | E2E admin scenarios have no admin; production has no bootstrap path | E2E: register a user, then set `isAdmin = true` via `DataSource` in `beforeAll`. Production bootstrap (seed script or CLI) is a **follow-up**; record it as an open issue |
-| **G10. Existing bad data** | Plaintext passwords and users who self-promoted already exist in the DB | **Follow-up**: one-off script to bcrypt-hash any password not matching `^\$2[aby]\$`, an audit of `isAdmin = true` rows, and lowercasing existing `user.email` values. Legacy mixed-case rows (e.g. `A@x.dev`) would otherwise escape the case-insensitive 409 check and, after Cycle 3, fail to log in; any rows that collide once lowercased must be resolved by hand. Not part of this change |
+| **G10. Existing bad data** | Plaintext passwords and users who self-promoted already exist in the DB | **Follow-up**: one-off script to bcrypt-hash any password not matching `^\$2[aby]\$`, an audit of `isAdmin = true` rows, and lowercasing existing `user.email` values. Plaintext and differently-costed hashes also make login timing distinguishable (G7); consider rehash-on-login when the stored cost differs from `JWT_SALT_OR_ROUNDS`. Legacy mixed-case rows (e.g. `A@x.dev`) would otherwise escape the case-insensitive 409 check and, after Cycle 3, fail to log in; any rows that collide once lowercased must be resolved by hand. Not part of this change |
 | **G11. E2E isolation** | Tests write to the dev DB | Unique emails per run (`` `e2e-${Date.now()}-n@test.dev` ``), delete them in `afterAll`, and call `app.close()` |
 | **G12. Login body isn't validated by the pipe** | Passport runs before pipes | Acceptable: passport-local returns 401 for missing fields. Covered by an e2e test |
 | **G13. CI doesn't run e2e** | E2E regressions go unnoticed | DoD requires a local e2e run. Adding a Postgres service to CI is a follow-up |
@@ -84,7 +84,7 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 - `src/auth/auth.service.ts`: `signUp(dto: RegisterDto)` forces `isAdmin: false`.
 - `src/user/dto/update-user.dto.ts`: `PartialType(CreateUserDto, { skipNullProperties: false })`; `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of `@IsOptional()` (G14).
 
-**Known interim gap (Cycles 1–3):** after Cycle 1, emails are stored lowercased, but `validateUser` still looks them up as typed until Cycle 3. A user registered as `Foo@Bar.dev` (stored `foo@bar.dev`) who logs in with `Foo@Bar.dev` gets a 404 until then. Cycle 1 must not be merged or deployed without Cycle 3; state this in the PR Test Plan.
+**Known interim gap (Cycles 1–3), resolved in Cycle 3:** after Cycle 1, emails are stored lowercased, but `validateUser` still looks them up as typed until Cycle 3. A user registered as `Foo@Bar.dev` (stored `foo@bar.dev`) who logs in with `Foo@Bar.dev` gets a 404 until then. Cycle 1 must not be merged or deployed without Cycle 3; state this in the PR Test Plan.
 
 ### Cycle 2: Hash on every write path (finding 2)
 **Red**
@@ -115,13 +115,24 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 - `src/user/user.service.spec.ts`: `findOneByEmail` resolves `null` when the user is missing.
 - `src/auth/auth.service.spec.ts`:
   - `validateUser` returns `null` for an unknown email **and still calls `bcrypt.compare`** (dummy hash).
-  - The dummy hash must use the same salt rounds as real hashes. Get it from `UserService` (e.g. a public `hashPassword` or a `saltRounds` getter) rather than re-reading `JWT_SALT_OR_ROUNDS` in `AuthService`, so there is one source of truth (G16). Then decide whether to keep or drop `AuthService`'s now-unused `ConfigService` parameter.
-  - It lowercases the email before the lookup.
-- E2E: login with an unknown email and with a wrong password both return 401 with identical bodies.
+  - The dummy hash must use the same salt rounds as real hashes. **Decision:** `UserService.hashPassword` becomes public and is the one source of salt rounds (G16). `AuthService` builds the dummy hash from it once, caching the promise per instance, and never re-reads `JWT_SALT_OR_ROUNDS`. `AuthService` drops its unused `ConfigService` parameter.
+  - The dummy hash is started once at startup (`onModuleInit`) and reused. Without init it is computed lazily, once, even under concurrent logins, and not at all for known users. A rejected hash is retried, never cached, and a failure at startup doesn't throw.
+  - It trims and lowercases the email before the lookup.
+  - A non-string `username` or `password` returns `null` (401) before any lookup. Login bypasses the ValidationPipe, and `.trim()` / `bcrypt.compare` would otherwise throw a 500 (found in review).
+- E2E:
+  - Login with an unknown email and with a wrong password both return 401 with identical bodies (`{ statusCode: 401, message: 'Unauthorized' }`).
+  - Login with a differently cased and padded email succeeds. This closes the Cycle 1–3 interim gap.
+  - A non-string `username` or `password` returns 401.
 
 **Green**
-- `src/user/user.service.ts`: `findOneByEmail` returns `Promise<User | null>`.
-- `src/auth/auth.service.ts`: dummy-hash compare when the user is missing.
+- `src/user/user.service.ts`: `findOneByEmail` returns `Promise<User | null>`, and `hashPassword` is public.
+- `src/auth/auth.service.ts`:
+  - Normalise the email.
+  - Dummy-hash compare when the user is missing, using the cached `usersService.hashPassword(<random>)`.
+    - The cache is cleared on rejection.
+    - It is warmed in `onModuleInit` without being awaited, and errors there are swallowed.
+  - Return `null` early for non-string credentials.
+  - Remove the `ConfigService` constructor parameter.
 
 ### Cycle 4: Status codes & return values (finding 4, G4, G5, G6)
 **Red**
