@@ -4,9 +4,11 @@ import { Reflector } from '@nestjs/core';
 import { ROLES_KEY } from 'src/decorators/role.decorator';
 import { Role } from 'src/types';
 import { RolesGuard } from './role.guard';
+import { spyOnAllLogging } from '../../test/utils/spy-on-logging';
 
 describe('RolesGuard', () => {
   let guard: RolesGuard;
+  let logging: ReturnType<typeof spyOnAllLogging>;
   const mockReflector = {
     getAllAndOverride: jest.fn(),
   };
@@ -33,13 +35,14 @@ describe('RolesGuard', () => {
 
   beforeEach(async () => {
     jest.resetAllMocks();
-    jest.spyOn(console, 'log').mockImplementation(() => undefined);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [RolesGuard, { provide: Reflector, useValue: mockReflector }],
     }).compile();
 
     guard = module.get<RolesGuard>(RolesGuard);
+    // Spy after compile so only canActivate() is inside the spy window.
+    logging = spyOnAllLogging();
   });
 
   afterEach(() => {
@@ -89,12 +92,12 @@ describe('RolesGuard', () => {
       expect(result).toBe(true);
     });
 
-    it('should not log the request user', () => {
+    it('should not log the request user on any console or Nest Logger channel', () => {
       mockReflector.getAllAndOverride.mockReturnValue([Role.ADMIN]);
 
       guard.canActivate(makeContext(makeUser({ isAdmin: true })));
 
-      expect(console.log).not.toHaveBeenCalled();
+      logging.expectNoLogging();
     });
   });
 });
