@@ -137,7 +137,6 @@ describe('AuthService', () => {
           password: '',
           firstname: '',
           lastname: '',
-          isAdmin: false,
         }),
       ).rejects.toThrow(InternalServerErrorException);
     });

@@ -29,13 +29,17 @@ These are now part of the plan:
 | **G7. Timing-based enumeration** after the 404→401 fix | Unknown emails respond faster (no bcrypt work) | Compare against a dummy hash generated once with the same salt rounds |
 | **G8. E2E harness is broken.** `test/jest-e2e.json` has no `moduleNameMapper` for `src/...` imports, and the only e2e test hits a non-existent, guarded `GET /` | The e2e red phase can't run at all | Add `"moduleNameMapper": {"^src/(.*)$": "<rootDir>/../src/$1"}` and replace the `GET /` test |
 | **G9. No way to create an admin** once register can't set `isAdmin` | E2E admin scenarios have no admin; production has no bootstrap path | E2E: register a user, then set `isAdmin = true` via `DataSource` in `beforeAll`. Production bootstrap (seed script or CLI) is a **follow-up**; record it as an open issue |
-| **G10. Existing bad data** | Plaintext passwords and users who self-promoted already exist in the DB | **Follow-up**: one-off script to bcrypt-hash any password not matching `^\$2[aby]\$`, and an audit of `isAdmin = true` rows. Not part of this change |
+| **G10. Existing bad data** | Plaintext passwords and users who self-promoted already exist in the DB | **Follow-up**: one-off script to bcrypt-hash any password not matching `^\$2[aby]\$`, an audit of `isAdmin = true` rows, and lowercasing existing `user.email` values. Legacy mixed-case rows (e.g. `A@x.dev`) would otherwise escape the case-insensitive 409 check and, after Cycle 3, fail to log in; any rows that collide once lowercased must be resolved by hand. Not part of this change |
 | **G11. E2E isolation** | Tests write to the dev DB | Unique emails per run (`` `e2e-${Date.now()}-n@test.dev` ``), delete them in `afterAll`, and call `app.close()` |
 | **G12. Login body isn't validated by the pipe** | Passport runs before pipes | Acceptable: passport-local returns 401 for missing fields. Covered by an e2e test |
 | **G13. CI doesn't run e2e** | E2E regressions go unnoticed | DoD requires a local e2e run. Adding a Postgres service to CI is a follow-up |
+| **G14. Explicit `null` on PATCH** (found in review) | `PartialType` applies `@IsOptional()`, which skips validation for `null` too. `PATCH /user/:id {"firstname": null}` reaches a NOT NULL column → 500; after Cycle 2, `{"password": null}` would reach `bcrypt.hash(null)` | `PartialType(CreateUserDto, { skipNullProperties: false })`: `null` is validated and rejected (400), omitted fields are still skipped. `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of its own `@IsOptional()`, which would otherwise keep skipping `isAdmin: null` on both `POST /user` and `PATCH` |
+| **G15. Zero-width-only names** (found in review) | `String.prototype.trim` doesn't strip U+200B and similar characters, so a name that looks blank is accepted | **Accepted**: cosmetic only, no security impact. Revisit if display names matter |
 
 ## Design decisions
-- **Global strict validation.** `APP_PIPE` = `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })` in `AppModule`, not `main.ts`, so e2e tests get it.
+- **Global strict validation.** `APP_PIPE` = `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })` in `AppModule`, not `main.ts`, so e2e tests get it. The options live in `src/validation-pipe.options.ts` (`validationPipeOptions`) so a unit spec can exercise the same configuration.
+- **Names are trimmed.** `firstname`/`lastname` get a trim `@Transform`, so whitespace-only names fail `@IsNotEmpty()`.
+- **`UpdateUserDto`** = `PartialType(CreateUserDto, { skipNullProperties: false })`, so omitted fields are optional but `null` is rejected (G14).
 - **`RegisterDto`** = `OmitType(CreateUserDto, ['isAdmin'] as const)`. `signUp` also forces `isAdmin: false`.
 - **Hashing only in `UserService`** (`create` and `update`). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10).
 - **`findOneByEmail` returns `User | null`.** Its only caller is `validateUser`.
@@ -57,11 +61,12 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 ### Cycle 1: Validation & no self-promotion (finding 1, G1, G2, G3)
 **Red**
 - New `src/user/dto/create-user.dto.spec.ts`, using `plainToInstance` + `validate`:
-  - Rejects a bad email, empty names, and passwords shorter than 8 or longer than 72 characters.
-  - Accepts optional `isAdmin`.
+  - Rejects a bad email, empty or whitespace-only names, and passwords shorter than 8 or longer than 72 characters.
+  - Trims surrounding whitespace from names.
+  - Accepts optional `isAdmin`, but rejects `isAdmin: null` (G14).
   - Lowercases and trims the email.
 - New `src/auth/dto/register.dto.spec.ts`: `isAdmin` is not a known property. With `forbidNonWhitelisted`, validation errors on it.
-- New `src/user/dto/update-user.dto.spec.ts`: `plainToInstance(UpdateUserDto, {password: 'x'.repeat(8)})` has **no `isAdmin` key** (G1). All fields are optional.
+- New `src/user/dto/update-user.dto.spec.ts`: `plainToInstance(UpdateUserDto, {password: 'x'.repeat(8)})` has **no `isAdmin` key** (G1). All fields are optional, but an explicit `null` on any field is rejected (G14).
 - `src/auth/auth.service.spec.ts`: `signUp` calls `usersService.create` with `isAdmin: false`, even when the input contains `isAdmin: true`.
 - `src/app.controller.spec.ts`: `register(dto)` passes the DTO to `signUp`.
 - E2E:
@@ -76,6 +81,9 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 - Add `APP_PIPE` in `src/app.module.ts`.
 - `src/app.controller.ts`: `@Body() dto: RegisterDto`.
 - `src/auth/auth.service.ts`: `signUp(dto: RegisterDto)` forces `isAdmin: false`.
+- `src/user/dto/update-user.dto.ts`: `PartialType(CreateUserDto, { skipNullProperties: false })`; `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of `@IsOptional()` (G14).
+
+**Known interim gap (Cycles 1–3):** after Cycle 1, emails are stored lowercased, but `validateUser` still looks them up as typed until Cycle 3. A user registered as `Foo@Bar.dev` (stored `foo@bar.dev`) who logs in with `Foo@Bar.dev` gets a 404 until then. Cycle 1 must not be merged or deployed without Cycle 3; state this in the PR Test Plan.
 
 ### Cycle 2: Hash on every write path (finding 2)
 **Red**
@@ -136,7 +144,7 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 
 ### Final refactor
 - Run `npm run format` and `npx eslint "{src,apps,libs,test}/**/*.ts"`.
-- Update the CLAUDE.md Architecture notes on global validation, `RegisterDto` and where hashing lives.
+- Update the CLAUDE.md Architecture notes on global validation (including `src/validation-pipe.options.ts`), `RegisterDto` and where hashing lives.
 
 ## Files touched (summary)
 - **Modified:**
@@ -144,11 +152,12 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
   - `test/jest-e2e.json`
   - `src/app.module.ts`, `src/app.controller.ts`
   - `src/auth/auth.service.ts`, `src/auth/jwt.strategy.ts`, `src/auth/role.guard.ts`
-  - `src/user/user.service.ts`, `src/user/user.controller.ts`, `src/user/dto/create-user.dto.ts`
+  - `src/user/user.service.ts`, `src/user/user.controller.ts`, `src/user/dto/create-user.dto.ts`, `src/user/dto/update-user.dto.ts`
   - Existing specs: `auth.service`, `user.service`, `user.controller`, `app.controller`
   - `CLAUDE.md`
 - **New:**
   - `src/auth/dto/register.dto.ts`
+  - `src/validation-pipe.options.ts` and `src/validation-pipe.options.spec.ts`
   - DTO specs ×3
   - `src/auth/jwt.strategy.spec.ts`, `src/auth/role.guard.spec.ts`
   - `test/auth-user.e2e-spec.ts`
@@ -170,7 +179,7 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
    - `npm test`
    - `npm run build`
    - `npm run test:e2e` (local DB)
-7. Follow-ups are recorded as issues: admin bootstrap (G9), rehash/audit of existing data (G10) and e2e in CI (G13).
+7. Follow-ups are recorded as issues: admin bootstrap (G9), rehash/audit/email-lowercasing of existing data (G10) and e2e in CI (G13).
 
 ## Verification
 1. Per cycle: `npm test -- <pattern>` fails at Red and passes at Green. Capture both outputs in the PR Test Plan.

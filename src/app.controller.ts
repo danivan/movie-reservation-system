@@ -1,4 +1,5 @@
 import {
+  Body,
   Controller,
   Request,
   Post,
@@ -9,6 +10,7 @@ import {
 import { LocalAuthGuard } from './auth/local-auth.guard';
 import { AuthService } from './auth/auth.service';
 import { Public } from './decorators/public.decorator';
+import { RegisterDto } from './auth/dto/register.dto';
 
 @Controller()
 export class AppController {
@@ -24,7 +26,7 @@ export class AppController {
   @Public()
   @UseInterceptors(ClassSerializerInterceptor)
   @Post('auth/register')
-  async register(@Request() req: any) {
-    return this.authService.signUp(req.body);
+  async register(@Body() registerDto: RegisterDto) {
+    return this.authService.signUp(registerDto);
   }
 }

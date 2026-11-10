@@ -1,7 +1,7 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
-import { CreateUserDto } from 'src/user/dto/create-user.dto';
+import { RegisterDto } from './dto/register.dto';
 import * as bcrypt from 'bcrypt';
 import { User } from 'src/user/entities/user.entity';
 import { ConfigService } from '@nestjs/config';
@@ -29,7 +29,7 @@ export class AuthService {
     return null;
   }
 
-  async signUp(payload: CreateUserDto): Promise<User> {
+  async signUp(payload: RegisterDto): Promise<User> {
     if (!payload) {
       throw new Error('Invalid user data');
     }
@@ -39,6 +39,7 @@ export class AuthService {
     const data = {
       ...payload,
       password: hashPass,
+      isAdmin: false,
     };
 
     try {
