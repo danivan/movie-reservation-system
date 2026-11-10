@@ -62,6 +62,12 @@ describe('RegisterDto', () => {
       expect(await invalidProperties({ firstname: '' })).toContain('firstname');
     });
 
+    it('should reject a whitespace-only firstname', async () => {
+      expect(await invalidProperties({ firstname: '   ' })).toContain(
+        'firstname',
+      );
+    });
+
     it('should trim and lowercase the email', () => {
       const dto = plainToInstance(
         RegisterDto,

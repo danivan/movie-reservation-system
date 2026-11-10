@@ -14,6 +14,20 @@ describe('UpdateUserDto', () => {
 
       expect(dto).not.toHaveProperty('isAdmin');
     });
+
+    it('should keep isAdmin true when it is given', () => {
+      const dto = plainToInstance(UpdateUserDto, { isAdmin: true });
+
+      expect(dto.isAdmin).toBe(true);
+    });
+
+    it('should accept isAdmin true with no validation errors', async () => {
+      const errors = await validate(
+        plainToInstance(UpdateUserDto, { isAdmin: true }),
+      );
+
+      expect(errors).toEqual([]);
+    });
   });
 
   describe('optional fields', () => {
@@ -30,6 +44,23 @@ describe('UpdateUserDto', () => {
 
       expect(errors).toEqual([]);
     });
+
+    it('should accept a field explicitly set to undefined', async () => {
+      const errors = await validate(
+        plainToInstance(UpdateUserDto, { firstname: undefined }),
+      );
+
+      expect(errors).toEqual([]);
+    });
+  });
+
+  describe('explicit null', () => {
+    it.each(['firstname', 'lastname', 'email', 'password', 'isAdmin'])(
+      'should reject %s set to null',
+      async (field) => {
+        expect(await invalidProperties({ [field]: null })).toContain(field);
+      },
+    );
   });
 
   describe('inherited CreateUserDto rules', () => {
@@ -55,6 +86,12 @@ describe('UpdateUserDto', () => {
       const dto = plainToInstance(UpdateUserDto, { email: '  Foo@Bar.DEV ' });
 
       expect(dto.email).toBe('foo@bar.dev');
+    });
+
+    it('should reject a whitespace-only lastname', async () => {
+      expect(await invalidProperties({ lastname: '   ' })).toContain(
+        'lastname',
+      );
     });
   });
 });

@@ -55,6 +55,29 @@ describe('CreateUserDto', () => {
         'firstname',
       );
     });
+
+    it('should reject a whitespace-only firstname', async () => {
+      expect(await invalidProperties({ firstname: '   ' })).toContain(
+        'firstname',
+      );
+    });
+
+    it('should trim surrounding whitespace from the firstname', () => {
+      const dto = plainToInstance(
+        CreateUserDto,
+        makeCreateUserBody({ firstname: '  Jane  ' }),
+      );
+
+      expect(dto.firstname).toBe('Jane');
+    });
+
+    it('should accept a firstname that is valid once trimmed', async () => {
+      const errors = await validateBody(
+        makeCreateUserBody({ firstname: '  Jane  ' }),
+      );
+
+      expect(errors).toEqual([]);
+    });
   });
 
   describe('lastname', () => {
@@ -66,6 +89,33 @@ describe('CreateUserDto', () => {
       expect(await invalidProperties({ lastname: undefined })).toContain(
         'lastname',
       );
+    });
+
+    it('should reject a non-string lastname', async () => {
+      expect(await invalidProperties({ lastname: 123 })).toContain('lastname');
+    });
+
+    it('should reject a whitespace-only lastname', async () => {
+      expect(await invalidProperties({ lastname: '   ' })).toContain(
+        'lastname',
+      );
+    });
+
+    it('should trim surrounding whitespace from the lastname', () => {
+      const dto = plainToInstance(
+        CreateUserDto,
+        makeCreateUserBody({ lastname: '  Doe  ' }),
+      );
+
+      expect(dto.lastname).toBe('Doe');
+    });
+
+    it('should accept a lastname that is valid once trimmed', async () => {
+      const errors = await validateBody(
+        makeCreateUserBody({ lastname: '  Doe  ' }),
+      );
+
+      expect(errors).toEqual([]);
     });
   });
 
@@ -151,6 +201,22 @@ describe('CreateUserDto', () => {
   describe('isAdmin', () => {
     it('should reject a non-boolean isAdmin', async () => {
       expect(await invalidProperties({ isAdmin: 'yes' })).toContain('isAdmin');
+    });
+
+    it('should reject the string "true" without converting it', async () => {
+      expect(await invalidProperties({ isAdmin: 'true' })).toContain('isAdmin');
+    });
+
+    it('should reject isAdmin set to null', async () => {
+      expect(await invalidProperties({ isAdmin: null })).toContain('isAdmin');
+    });
+
+    it('should accept isAdmin explicitly undefined', async () => {
+      const errors = await validateBody(
+        makeCreateUserBody({ isAdmin: undefined }),
+      );
+
+      expect(errors).toEqual([]);
     });
   });
 });

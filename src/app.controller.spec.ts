@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppController } from './app.controller';
 import { AuthService } from './auth/auth.service';
+import { RegisterDto } from './auth/dto/register.dto';
 
 describe('AppController', () => {
   let appController: AppController;
@@ -47,7 +48,18 @@ describe('AppController', () => {
       const result = await appController.register(dto);
 
       expect(mockAuthService.signUp).toHaveBeenCalledWith(dto);
+      expect(mockAuthService.signUp.mock.calls[0][0]).toBe(dto);
       expect(result).toEqual(created);
+    });
+
+    it('should type the register body parameter as RegisterDto', () => {
+      const paramTypes = Reflect.getMetadata(
+        'design:paramtypes',
+        AppController.prototype,
+        'register',
+      );
+
+      expect(paramTypes[0]).toBe(RegisterDto);
     });
   });
 });
