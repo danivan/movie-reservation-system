@@ -6,14 +6,12 @@ import {
   Patch,
   Param,
   Delete,
-  UseGuards,
   UseInterceptors,
   ClassSerializerInterceptor,
 } from '@nestjs/common';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
-import { JwtAuthGuard } from 'src/auth/jwt-auth.guard';
 import { Role } from 'src/types';
 import { Roles } from 'src/decorators/role.decorator';
 
