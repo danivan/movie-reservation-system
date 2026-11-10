@@ -15,7 +15,7 @@ export class AuthService {
   ) {}
 
   private saltOrRounds =
-    this.configService.get<number | string>('JWT_SALT_OR_ROUNDS') || 10;
+    Number(this.configService.get<string>('JWT_SALT_OR_ROUNDS')) || 10;
 
   async validateUser(email: string, pass: string): Promise<any> {
     const user = await this.usersService.findOneByEmail(email);
@@ -51,7 +51,7 @@ export class AuthService {
   }
 
   async login(user: User) {
-    const payload = { email: user.email, sub: user.id };
+    const payload = { email: user.email, sub: user.id, isAdmin: user.isAdmin };
     return {
       access_token: this.jwtService.sign(payload),
     };
