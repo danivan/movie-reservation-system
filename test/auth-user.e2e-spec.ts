@@ -531,4 +531,32 @@ describe('Auth & User (e2e)', () => {
         .expect(401);
     });
   });
+
+  describe('logging', () => {
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    // Only console.log is checked. Nest's own Logger writes to stdout
+    // directly, not through console.log, so legitimate Nest logging does not
+    // trip this test.
+    it('should not write to console.log while handling an authenticated admin request', async () => {
+      // Seed before spying: register is public and its log output is not
+      // what this test is about.
+      const user = await seedUser();
+      jest.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      // GET /user passes through JwtStrategy.validate.
+      await authed(request(server()).get('/user'), adminToken).expect(200);
+      // PATCH /user/:id is @Roles(ADMIN), so it also passes through RolesGuard.
+      await authed(
+        request(server())
+          .patch(`/user/${user.id}`)
+          .send({ firstname: 'Quiet' }),
+        adminToken,
+      ).expect(200);
+
+      expect(console.log).not.toHaveBeenCalled();
+    });
+  });
 });
