@@ -165,13 +165,16 @@ describe('UserService', () => {
   });
 
   describe('findOneByEmail', () => {
-    it('should return the user when found', async () => {
+    it('should look the user up by the given email and return it', async () => {
       const user = makeUser({ id: 3, email: 'jane@example.com' });
       mockUserRepository.findOneBy.mockResolvedValue(user);
 
       const result = await service.findOneByEmail('jane@example.com');
 
       expect(result).toEqual(user);
+      expect(mockUserRepository.findOneBy).toHaveBeenCalledWith({
+        email: 'jane@example.com',
+      });
     });
 
     it('should return null when the user does not exist', async () => {
@@ -180,14 +183,6 @@ describe('UserService', () => {
       await expect(
         service.findOneByEmail('missing@example.com'),
       ).resolves.toBeNull();
-    });
-
-    it('should look the user up by the given email', async () => {
-      await service.findOneByEmail('jane@example.com');
-
-      expect(mockUserRepository.findOneBy).toHaveBeenCalledWith({
-        email: 'jane@example.com',
-      });
     });
   });
 

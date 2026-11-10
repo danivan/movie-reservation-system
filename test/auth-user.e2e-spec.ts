@@ -309,17 +309,41 @@ describe('Auth & User (e2e)', () => {
 
       expect(wrongPassword.status).toBe(401);
       expect(unknownEmail.status).toBe(401);
+      expect(wrongPassword.body).toEqual({
+        statusCode: 401,
+        message: 'Unauthorized',
+      });
       expect(unknownEmail.body).toEqual(wrongPassword.body);
     });
 
-    it('should log in with a differently cased email', async () => {
+    it('should log in with a differently cased and padded email', async () => {
       const email = uniqueEmail();
       await registerUser(email);
-      const typed = `  ${email.replace('@test.dev', '@TEST.DEV')} `;
+      const recased = email
+        .replace('e2e', 'E2E')
+        .replace('@test.dev', '@TeSt.DeV');
+      const typed = `  ${recased} `;
 
       const res = await login(typed, PASSWORD).expect(201);
 
       expect(res.body.access_token).toEqual(expect.any(String));
+    });
+
+    it('should return 401 for a non-string username', async () => {
+      await request(server())
+        .post('/auth/login')
+        .send({ username: 123, password: 'whatever1' })
+        .expect(401);
+    });
+
+    it('should return 401 for a non-string password', async () => {
+      const email = uniqueEmail();
+      await registerUser(email);
+
+      await request(server())
+        .post('/auth/login')
+        .send({ username: email, password: 12345678 })
+        .expect(401);
     });
   });
 });

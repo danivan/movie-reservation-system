@@ -9,6 +9,7 @@ import { User } from 'src/user/entities/user.entity';
 jest.mock('bcrypt');
 
 describe('AuthService', () => {
+  let module: TestingModule;
   let service: AuthService;
   const mockUserService = {
     findOneByEmail: jest.fn(),
@@ -30,6 +31,15 @@ describe('AuthService', () => {
     ...overrides,
   });
 
+  // The random plaintext AuthService handed to hashPassword on its nth call.
+  const dummyPlain = (n = 0): string =>
+    mockUserService.hashPassword.mock.calls[n][0];
+
+  // Lets already-settled promise handlers (e.g. a swallowed rejection) run.
+  const flushPromises = () => new Promise((r) => setImmediate(r));
+
+  const NON_STRINGS: unknown[] = [123, true, null, undefined, {}, ['a']];
+
   beforeEach(async () => {
     // resetAllMocks (not clearAllMocks) so no implementation or *Once queue
     // leaks from one test into the next; every default is re-stubbed below.
@@ -38,10 +48,16 @@ describe('AuthService', () => {
     (bcrypt.compare as jest.Mock).mockResolvedValue(false);
     mockUserService.findOneByEmail.mockResolvedValue(null);
     mockUserService.create.mockResolvedValue({ id: 1 });
-    mockUserService.hashPassword.mockResolvedValue('dummy-hash');
+    // Output depends on the input, so comparing against anything other than
+    // the hash of the plaintext AuthService generated is caught.
+    mockUserService.hashPassword.mockImplementation(
+      async (plain: string) => `hashed:${plain}`,
+    );
     mockJwtService.sign.mockReturnValue('signed-token');
 
-    const module: TestingModule = await Test.createTestingModule({
+    // compile() only: lifecycle hooks (onModuleInit) do not run unless a test
+    // calls module.init() explicitly.
+    module = await Test.createTestingModule({
       providers: [
         AuthService,
         { provide: UserService, useValue: mockUserService },
@@ -105,33 +121,73 @@ describe('AuthService', () => {
 
       expect(user).toBeNull();
       // Equalises timing with the wrong-password path (G7).
+      const plain = dummyPlain();
+      expect(plain).toMatch(/^[0-9a-f]{32}$/);
       expect(bcrypt.compare).toHaveBeenCalledWith(
         'plain-password',
-        'dummy-hash',
+        `hashed:${plain}`,
       );
     });
 
-    it('should compute the dummy hash only once', async () => {
-      mockUserService.findOneByEmail.mockResolvedValue(null);
+    it('should return null for an unknown email even if compare resolves true', async () => {
+      mockUserService.findOneByEmail.mockResolvedValueOnce(null);
+      (bcrypt.compare as jest.Mock).mockResolvedValueOnce(true);
 
+      await expect(
+        service.validateUser('missing@example.com', 'plain-password'),
+      ).resolves.toBeNull();
+    });
+
+    it('should compute the dummy hash only once', async () => {
       await service.validateUser('missing-1@example.com', 'first-password');
       await service.validateUser('missing-2@example.com', 'second-password');
 
       expect(mockUserService.hashPassword).toHaveBeenCalledTimes(1);
-      expect(mockUserService.hashPassword).toHaveBeenCalledWith(
-        expect.any(String),
-      );
+      const plain = dummyPlain();
+      expect(plain).toMatch(/^[0-9a-f]{32}$/);
       expect(bcrypt.compare).toHaveBeenCalledWith(
         'first-password',
-        'dummy-hash',
+        `hashed:${plain}`,
       );
       expect(bcrypt.compare).toHaveBeenCalledWith(
         'second-password',
-        'dummy-hash',
+        `hashed:${plain}`,
+      );
+    });
+
+    it('should compute the dummy hash once under concurrent unknown-email logins', async () => {
+      await Promise.all([
+        service.validateUser('a@x.dev', 'p1'),
+        service.validateUser('b@x.dev', 'p2'),
+      ]);
+
+      expect(mockUserService.hashPassword).toHaveBeenCalledTimes(1);
+      const plain = dummyPlain();
+      expect(bcrypt.compare).toHaveBeenCalledWith('p1', `hashed:${plain}`);
+      expect(bcrypt.compare).toHaveBeenCalledWith('p2', `hashed:${plain}`);
+    });
+
+    it('should retry the dummy hash after hashPassword rejects', async () => {
+      mockUserService.hashPassword.mockRejectedValueOnce(new Error('boom'));
+
+      await expect(
+        service.validateUser('missing-1@example.com', 'first-password'),
+      ).rejects.toThrow('boom');
+      await expect(
+        service.validateUser('missing-2@example.com', 'second-password'),
+      ).resolves.toBeNull();
+
+      expect(mockUserService.hashPassword).toHaveBeenCalledTimes(2);
+      const plain = dummyPlain(1);
+      expect(plain).toMatch(/^[0-9a-f]{32}$/);
+      expect(bcrypt.compare).toHaveBeenCalledWith(
+        'second-password',
+        `hashed:${plain}`,
       );
     });
 
     it('should not compute a dummy hash for a known user', async () => {
+      // Plain compile(), no init: the lazy path must not hash for known users.
       // Wrong password: the non-matching path must not fall through to the
       // dummy-hash work either.
       mockUserService.findOneByEmail.mockResolvedValueOnce(makeUser());
@@ -142,7 +198,7 @@ describe('AuthService', () => {
       expect(mockUserService.hashPassword).not.toHaveBeenCalled();
       expect(bcrypt.compare).not.toHaveBeenCalledWith(
         expect.anything(),
-        'dummy-hash',
+        expect.stringMatching(/^hashed:/),
       );
     });
 
@@ -154,12 +210,73 @@ describe('AuthService', () => {
       );
     });
 
-    it('should return null without throwing when findOneByEmail returns null', async () => {
-      mockUserService.findOneByEmail.mockResolvedValueOnce(null);
+    it.each(NON_STRINGS)(
+      'should return null for a non-string email %p without looking anything up',
+      async (email) => {
+        await expect(
+          service.validateUser(email as any, 'plain-password'),
+        ).resolves.toBeNull();
+
+        expect(mockUserService.findOneByEmail).not.toHaveBeenCalled();
+        expect(bcrypt.compare).not.toHaveBeenCalled();
+        expect(mockUserService.hashPassword).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(NON_STRINGS)(
+      'should return null for a non-string password %p without looking anything up',
+      async (pass) => {
+        await expect(
+          service.validateUser('test@example.com', pass as any),
+        ).resolves.toBeNull();
+
+        expect(mockUserService.findOneByEmail).not.toHaveBeenCalled();
+        expect(bcrypt.compare).not.toHaveBeenCalled();
+        expect(mockUserService.hashPassword).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  describe('onModuleInit', () => {
+    it('should start computing the dummy hash at startup', async () => {
+      await module.init();
+
+      expect(mockUserService.hashPassword).toHaveBeenCalledTimes(1);
+      expect(dummyPlain()).toMatch(/^[0-9a-f]{32}$/);
+    });
+
+    it('should reuse the startup hash for unknown-email logins', async () => {
+      await module.init();
+
+      await service.validateUser('missing-1@example.com', 'first-password');
+      await service.validateUser('missing-2@example.com', 'second-password');
+
+      expect(mockUserService.hashPassword).toHaveBeenCalledTimes(1);
+      const plain = dummyPlain();
+      expect(bcrypt.compare).toHaveBeenCalledWith(
+        'first-password',
+        `hashed:${plain}`,
+      );
+      expect(bcrypt.compare).toHaveBeenCalledWith(
+        'second-password',
+        `hashed:${plain}`,
+      );
+    });
+
+    it('should not throw or reject at startup if hashPassword rejects', async () => {
+      mockUserService.hashPassword.mockRejectedValueOnce(new Error('boom'));
+
+      await expect(module.init()).resolves.toBe(module);
+      await flushPromises();
 
       await expect(
         service.validateUser('missing@example.com', 'plain-password'),
       ).resolves.toBeNull();
+      expect(mockUserService.hashPassword).toHaveBeenCalledTimes(2);
+      expect(bcrypt.compare).toHaveBeenCalledWith(
+        'plain-password',
+        `hashed:${dummyPlain(1)}`,
+      );
     });
   });
 
