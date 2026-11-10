@@ -35,13 +35,14 @@ These are now part of the plan:
 | **G13. CI doesn't run e2e** | E2E regressions go unnoticed | DoD requires a local e2e run. Adding a Postgres service to CI is a follow-up |
 | **G14. Explicit `null` on PATCH** (found in review) | `PartialType` applies `@IsOptional()`, which skips validation for `null` too. `PATCH /user/:id {"firstname": null}` reaches a NOT NULL column → 500; after Cycle 2, `{"password": null}` would reach `bcrypt.hash(null)` | `PartialType(CreateUserDto, { skipNullProperties: false })`: `null` is validated and rejected (400), omitted fields are still skipped. `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of its own `@IsOptional()`, which would otherwise keep skipping `isAdmin: null` on both `POST /user` and `PATCH` |
 | **G15. Zero-width-only names** (found in review) | `String.prototype.trim` doesn't strip U+200B and similar characters, so a name that looks blank is accepted | **Accepted**: cosmetic only, no security impact. Revisit if display names matter |
+| **G16. Unvalidated `JWT_SALT_OR_ROUNDS`** (found in review) | `Number(v) \|\| 10` only falls back for unset/`0`/non-numeric. `"1"`, `"4.5"` silently give bcrypt cost 4 (weak hashes); `"-1"`, `"20"`, `"31"` hang hashing, and concurrent password writes exhaust the libuv threadpool and stall logins | `UserService` reads it once at construction: unset or empty → 10; otherwise it must be an integer 10–15, else the constructor throws an `Error` naming `JWT_SALT_OR_ROUNDS` so the app fails at startup (a startup config error, not an HTTP error, so a plain `Error` is acceptable here) |
 
 ## Design decisions
 - **Global strict validation.** `APP_PIPE` = `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })` in `AppModule`, not `main.ts`, so e2e tests get it. The options live in `src/validation-pipe.options.ts` (`validationPipeOptions`) so a unit spec can exercise the same configuration.
 - **Names are trimmed.** `firstname`/`lastname` get a trim `@Transform`, so whitespace-only names fail `@IsNotEmpty()`.
 - **`UpdateUserDto`** = `PartialType(CreateUserDto, { skipNullProperties: false })`, so omitted fields are optional but `null` is rejected (G14).
 - **`RegisterDto`** = `OmitType(CreateUserDto, ['isAdmin'] as const)`. `signUp` also forces `isAdmin: false`.
-- **Hashing only in `UserService`** (`create` and `update`). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10).
+- **Hashing only in `UserService`** (`create` and `update`). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10), validated once at startup as an integer 10–15 (G16).
 - **`findOneByEmail` returns `User | null`.** Its only caller is `validateUser`.
 - **Unique violation** (`QueryFailedError`, `driverError.code === '23505'`) → `ConflictException`. Any other DB error → `InternalServerErrorException`. No bare `Error`s.
 - **`ParseIntPipe` on every `:id`** in `UserController`.
@@ -97,13 +98,24 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 
 **Green**
 - `src/user/user.service.ts`: inject `ConfigService` and add `hashPassword()`; use it in `create` and `update`.
-- `src/auth/auth.service.ts`: remove `saltOrRounds` and the hashing.
+  - Validate `JWT_SALT_OR_ROUNDS` once in the constructor (G16).
+  - In `update`, hash when `password != null`. The DTO already rejects `null` over HTTP; this guards non-HTTP callers.
+- `src/auth/auth.service.ts`: remove `saltOrRounds` and the hashing. The `ConfigService` constructor parameter stays for now (see the Cycle 3 note).
+
+**Review-driven test hardening:**
+- Input-dependent `bcrypt.hash` stub, so double hashing is caught.
+- Exact `repo.update` payloads.
+- Frozen DTOs, so in-place mutation is caught.
+- `jest.resetAllMocks()` in `beforeEach`.
+- `auth.service.spec.ts` built with `Test.createTestingModule`.
+- E2E: a hash check after PATCH, the G1 precondition, and no `password` in the `POST /user` response.
 
 ### Cycle 3: Login 401 for unknown email (finding 3, G7)
 **Red**
 - `src/user/user.service.spec.ts`: `findOneByEmail` resolves `null` when the user is missing.
 - `src/auth/auth.service.spec.ts`:
   - `validateUser` returns `null` for an unknown email **and still calls `bcrypt.compare`** (dummy hash).
+  - The dummy hash must use the same salt rounds as real hashes. Get it from `UserService` (e.g. a public `hashPassword` or a `saltRounds` getter) rather than re-reading `JWT_SALT_OR_ROUNDS` in `AuthService`, so there is one source of truth (G16). Then decide whether to keep or drop `AuthService`'s now-unused `ConfigService` parameter.
   - It lowercases the email before the lookup.
 - E2E: login with an unknown email and with a wrong password both return 401 with identical bodies.
 

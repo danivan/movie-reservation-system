@@ -14,9 +14,6 @@ export class AuthService {
     private configService: ConfigService,
   ) {}
 
-  private saltOrRounds =
-    Number(this.configService.get<string>('JWT_SALT_OR_ROUNDS')) || 10;
-
   async validateUser(email: string, pass: string): Promise<any> {
     const user = await this.usersService.findOneByEmail(email);
 
@@ -34,11 +31,8 @@ export class AuthService {
       throw new Error('Invalid user data');
     }
 
-    const hashPass = await bcrypt.hash(payload.password, this.saltOrRounds);
-
     const data = {
       ...payload,
-      password: hashPass,
       isAdmin: false,
     };
 
