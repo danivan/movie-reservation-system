@@ -1,8 +1,15 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
+import { QueryFailedError } from 'typeorm';
 import { UserService } from './user.service';
 import { User } from './entities/user.entity';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -52,6 +59,35 @@ describe('UserService', () => {
     );
   };
 
+  // Values a real INSERT/UPDATE would carry; they must never reach a client
+  // or the log.
+  const SECRET_EMAIL = 'secret@x.dev';
+  const SECRET_HASH = '$2b$10$secret-hash-value';
+  const DB_TEXT = 'connection refused at 10.0.0.5';
+
+  // A TypeORM driver error as Postgres reports it, carrying the SQL
+  // parameters (email + hash) like a real failed write.
+  const queryFailed = (code: string, message: string) =>
+    new QueryFailedError(
+      'INSERT INTO "user" ...',
+      [SECRET_EMAIL, SECRET_HASH],
+      Object.assign(new Error(message), { code }),
+    );
+
+  const uniqueViolation = () =>
+    queryFailed('23505', 'duplicate key value violates unique constraint');
+
+  // Everything a log argument could expose: plain values, and for errors the
+  // message, stack and own enumerable props (query, parameters, ...).
+  const stringifyLogArg = (arg: unknown): string => {
+    if (arg instanceof Error) {
+      return [String(arg), arg.stack, JSON.stringify(arg)].join('\n');
+    }
+    return typeof arg === 'string' ? arg : String(JSON.stringify(arg));
+  };
+
+  let loggerErrorSpy: jest.SpyInstance;
+
   const buildService = async (): Promise<UserService> => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -85,8 +121,17 @@ describe('UserService', () => {
     }));
     mockUserRepository.findOneBy.mockResolvedValue(makeUser());
     mockUserRepository.update.mockResolvedValue({ affected: 1 });
+    mockUserRepository.delete.mockResolvedValue({ affected: 1 });
+    // Re-applied after resetAllMocks: silences the logger and records calls.
+    loggerErrorSpy = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
 
     service = await buildService();
+  });
+
+  afterAll(() => {
+    jest.restoreAllMocks();
   });
 
   it('should be defined', () => {
@@ -216,6 +261,64 @@ describe('UserService', () => {
 
       expect(dto.password).toBe('plain-password');
     });
+
+    it('should throw ConflictException when the email already exists', async () => {
+      mockUserRepository.save.mockRejectedValue(uniqueViolation());
+
+      const result = service.create(makeCreateUserDto({ email: SECRET_EMAIL }));
+
+      await expect(result).rejects.toBeInstanceOf(ConflictException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Email already in use',
+      });
+      await expect(result).rejects.toMatchObject({
+        message: expect.not.stringContaining(SECRET_EMAIL),
+      });
+    });
+
+    it('should throw a generic InternalServerErrorException for other DB errors', async () => {
+      mockUserRepository.save.mockRejectedValue(new Error(DB_TEXT));
+
+      const result = service.create(makeCreateUserDto());
+
+      await expect(result).rejects.toBeInstanceOf(InternalServerErrorException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Failed to create user',
+      });
+      await expect(result).rejects.toMatchObject({
+        message: expect.not.stringContaining('connection refused'),
+      });
+    });
+
+    it('should throw a generic InternalServerErrorException when hashing fails', async () => {
+      (bcrypt.hash as jest.Mock).mockRejectedValue(new Error(DB_TEXT));
+
+      const result = service.create(makeCreateUserDto());
+
+      await expect(result).rejects.toBeInstanceOf(InternalServerErrorException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Failed to create user',
+      });
+      expect(mockUserRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('should log unexpected errors without query parameters', async () => {
+      mockUserRepository.save.mockRejectedValue(
+        queryFailed('XX000', 'internal error'),
+      );
+
+      await expect(
+        service.create(makeCreateUserDto({ email: SECRET_EMAIL })),
+      ).rejects.toBeInstanceOf(InternalServerErrorException);
+
+      expect(loggerErrorSpy).toHaveBeenCalled();
+      const logged = loggerErrorSpy.mock.calls
+        .flat()
+        .map(stringifyLogArg)
+        .join('\n');
+      expect(logged).not.toContain(SECRET_EMAIL);
+      expect(logged).not.toContain(SECRET_HASH);
+    });
   });
 
   describe('update', () => {
@@ -265,6 +368,96 @@ describe('UserService', () => {
       ).rejects.toThrow(NotFoundException);
       expect(mockUserRepository.update).not.toHaveBeenCalled();
       expect(bcrypt.hash).not.toHaveBeenCalled();
+    });
+
+    it('should return the reloaded user', async () => {
+      const updated = makeUser({ id: 1, firstname: 'Jane' });
+      mockUserRepository.findOneBy
+        .mockResolvedValueOnce(makeUser({ id: 1 }))
+        .mockResolvedValueOnce(updated);
+
+      await expect(service.update(1, { firstname: 'Jane' })).resolves.toEqual(
+        updated,
+      );
+      expect(mockUserRepository.findOneBy).toHaveBeenCalledTimes(2);
+      expect(mockUserRepository.findOneBy).toHaveBeenNthCalledWith(2, {
+        id: 1,
+      });
+    });
+
+    it.each<[string, UpdateUserDto]>([
+      ['an empty dto', {}],
+      ['a dto whose only key is undefined', { firstname: undefined }],
+    ])(
+      'should throw BadRequestException for %s without touching the DB',
+      async (_label, dto) => {
+        const result = service.update(1, dto);
+
+        await expect(result).rejects.toBeInstanceOf(BadRequestException);
+        await expect(result).rejects.toMatchObject({
+          message: 'No fields to update',
+        });
+        expect(mockUserRepository.findOneBy).not.toHaveBeenCalled();
+        expect(mockUserRepository.update).not.toHaveBeenCalled();
+        expect(bcrypt.hash).not.toHaveBeenCalled();
+      },
+    );
+
+    it('should throw ConflictException when the new email is taken', async () => {
+      mockUserRepository.update.mockRejectedValue(uniqueViolation());
+
+      const result = service.update(1, { email: SECRET_EMAIL });
+
+      await expect(result).rejects.toBeInstanceOf(ConflictException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Email already in use',
+      });
+    });
+
+    it('should throw a generic InternalServerErrorException for other DB errors', async () => {
+      mockUserRepository.update.mockRejectedValue(new Error(DB_TEXT));
+
+      const result = service.update(1, { firstname: 'Jane' });
+
+      await expect(result).rejects.toBeInstanceOf(InternalServerErrorException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Failed to update user',
+      });
+      await expect(result).rejects.toMatchObject({
+        message: expect.not.stringContaining('connection refused'),
+      });
+    });
+  });
+
+  describe('remove', () => {
+    it('should delete an existing user', async () => {
+      mockUserRepository.findOneBy.mockResolvedValue(makeUser({ id: 2 }));
+
+      await expect(service.remove(2)).resolves.toBeUndefined();
+
+      expect(mockUserRepository.findOneBy).toHaveBeenCalledWith({ id: 2 });
+      expect(mockUserRepository.delete).toHaveBeenCalledWith(2);
+    });
+
+    it('should throw NotFoundException for an unknown id', async () => {
+      mockUserRepository.findOneBy.mockResolvedValue(null);
+
+      await expect(service.remove(99)).rejects.toThrow(NotFoundException);
+      expect(mockUserRepository.delete).not.toHaveBeenCalled();
+    });
+
+    it('should throw a generic InternalServerErrorException when delete fails', async () => {
+      mockUserRepository.delete.mockRejectedValue(new Error(DB_TEXT));
+
+      const result = service.remove(2);
+
+      await expect(result).rejects.toBeInstanceOf(InternalServerErrorException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Failed to remove user',
+      });
+      await expect(result).rejects.toMatchObject({
+        message: expect.not.stringContaining('connection refused'),
+      });
     });
   });
 });

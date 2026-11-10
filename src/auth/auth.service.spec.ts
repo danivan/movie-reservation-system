@@ -1,6 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from './auth.service';
-import { InternalServerErrorException } from '@nestjs/common';
+import {
+  ConflictException,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { UserService } from 'src/user/user.service';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -346,19 +349,32 @@ describe('AuthService', () => {
       );
     });
 
-    it('should throw an error for an invalid user', async () => {
-      mockUserService.create.mockRejectedValueOnce(
-        new Error('Failed to create user'),
-      );
+    it('should propagate ConflictException from usersService.create unchanged', async () => {
+      const err = new ConflictException('Email already in use');
+      mockUserService.create.mockRejectedValueOnce(err);
 
       await expect(
         service.signUp({
-          email: '',
-          password: '',
-          firstname: '',
-          lastname: '',
+          email: 'taken@example.com',
+          password: 'plain-password',
+          firstname: 'Jane',
+          lastname: 'Doe',
         }),
-      ).rejects.toThrow(InternalServerErrorException);
+      ).rejects.toBe(err);
+    });
+
+    it('should propagate other errors unchanged', async () => {
+      const err = new InternalServerErrorException('Failed to create user');
+      mockUserService.create.mockRejectedValueOnce(err);
+
+      await expect(
+        service.signUp({
+          email: 'jane@example.com',
+          password: 'plain-password',
+          firstname: 'Jane',
+          lastname: 'Doe',
+        }),
+      ).rejects.toBe(err);
     });
   });
 });

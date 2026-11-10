@@ -28,6 +28,17 @@ describe('Auth & User (e2e)', () => {
   const authed = (req: request.Test, token: string) =>
     req.set('Authorization', `Bearer ${token}`);
 
+  // Registers a fresh user and returns its DB row.
+  const seedUser = async (email = uniqueEmail()): Promise<User> => {
+    await register({
+      firstname: 'Sam',
+      lastname: 'Seeded',
+      email,
+      password: PASSWORD,
+    }).expect(201);
+    return dataSource.getRepository(User).findOneByOrFail({ email });
+  };
+
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
@@ -163,6 +174,19 @@ describe('Auth & User (e2e)', () => {
 
       expect(res.body).not.toHaveProperty('password');
     });
+
+    it('should return 409 for a duplicate email', async () => {
+      const email = uniqueEmail();
+      await register(makeRegisterBody({ email })).expect(201);
+      const recased = email.replace('@test.dev', '@TEST.DEV');
+
+      const res = await register(makeRegisterBody({ email: recased }));
+
+      expect(res.status).toBe(409);
+      expect(res.body.message).toBe('Email already in use');
+      expect(JSON.stringify(res.body)).not.toContain(email);
+      expect(JSON.stringify(res.body)).not.toContain(recased);
+    });
   });
 
   describe('POST /user', () => {
@@ -188,6 +212,26 @@ describe('Auth & User (e2e)', () => {
         .findOneByOrFail({ email });
       expect(row.password).toMatch(/^\$2[aby]\$/);
       expect(row.password).not.toBe(PASSWORD);
+    });
+
+    it('should return 409 for a duplicate email', async () => {
+      const email = uniqueEmail();
+      const createUser = () =>
+        authed(
+          request(server()).post('/user').send({
+            firstname: 'Dee',
+            lastname: 'Duplicate',
+            email,
+            password: PASSWORD,
+          }),
+          adminToken,
+        );
+      await createUser().expect(201);
+
+      const res = await createUser().expect(409);
+
+      expect(res.body.message).toBe('Email already in use');
+      expect(JSON.stringify(res.body)).not.toContain(email);
     });
   });
 
@@ -268,6 +312,93 @@ describe('Auth & User (e2e)', () => {
         .getRepository(User)
         .findOneBy({ id: user.id });
       expect(row?.firstname).toBe('Jane');
+    });
+
+    it('should return the updated user without password', async () => {
+      const user = await seedUser();
+
+      const res = await patchUser(user.id, { firstname: 'Renamed' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.id).toBe(user.id);
+      expect(res.body.firstname).toBe('Renamed');
+      expect(res.body.email).toBe(user.email);
+      expect(res.body).not.toHaveProperty('password');
+    });
+
+    it('should return 409 when changing to an existing email', async () => {
+      const taken = await seedUser();
+      const user = await seedUser();
+      const recased = taken.email.replace('@test.dev', '@TEST.DEV');
+
+      const res = await patchUser(user.id, { email: recased }).expect(409);
+
+      expect(res.body.message).toBe('Email already in use');
+      expect(JSON.stringify(res.body)).not.toContain(taken.email);
+      const row = await dataSource
+        .getRepository(User)
+        .findOneByOrFail({ id: user.id });
+      expect(row.email).toBe(user.email);
+    });
+
+    it('should return 400 for an empty body', async () => {
+      const user = await seedUser();
+
+      const res = await patchUser(user.id, {}).expect(400);
+
+      expect(res.body.message).toBe('No fields to update');
+    });
+
+    it('should return 404 for an unknown id', async () => {
+      await patchUser(999999999, { firstname: 'Ghost' }).expect(404);
+    });
+
+    it('should return 400 for a non-numeric id', async () => {
+      await authed(
+        request(server()).patch('/user/abc').send({ firstname: 'Abc' }),
+        adminToken,
+      ).expect(400);
+    });
+  });
+
+  describe('GET /user/:id', () => {
+    it('should return 400 for a non-numeric id', async () => {
+      await authed(request(server()).get('/user/abc'), adminToken).expect(400);
+    });
+
+    it('should return the user without password', async () => {
+      const user = await seedUser();
+
+      const res = await authed(
+        request(server()).get(`/user/${user.id}`),
+        adminToken,
+      ).expect(200);
+
+      expect(res.body.id).toBe(user.id);
+      expect(res.body.email).toBe(user.email);
+      expect(res.body).not.toHaveProperty('password');
+    });
+  });
+
+  describe('DELETE /user/:id', () => {
+    it('should return 400 for a non-numeric id', async () => {
+      const req = request(server()).delete('/user/abc');
+
+      await authed(req, adminToken).expect(400);
+    });
+
+    it('should delete a user', async () => {
+      const user = await seedUser();
+
+      await authed(
+        request(server()).delete(`/user/${user.id}`),
+        adminToken,
+      ).expect(200);
+
+      const row = await dataSource
+        .getRepository(User)
+        .findOneBy({ id: user.id });
+      expect(row).toBeNull();
     });
   });
 
