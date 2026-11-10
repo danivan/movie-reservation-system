@@ -272,8 +272,54 @@ describe('Auth & User (e2e)', () => {
   });
 
   describe('POST /auth/login', () => {
+    const registerUser = (email: string) =>
+      register({
+        firstname: 'Lou',
+        lastname: 'Login',
+        email,
+        password: PASSWORD,
+      }).expect(201);
+
     it('should reject an empty body with 401', async () => {
       await request(server()).post('/auth/login').send({}).expect(401);
+    });
+
+    it('should log in with correct credentials', async () => {
+      const email = uniqueEmail();
+      await registerUser(email);
+
+      const res = await login(email, PASSWORD).expect(201);
+
+      expect(res.body.access_token).toEqual(expect.any(String));
+    });
+
+    it('should return 401 for an unknown email', async () => {
+      // Never registered.
+      const email = uniqueEmail();
+
+      await login(email, PASSWORD).expect(401);
+    });
+
+    it('should return the same response for an unknown email as for a wrong password', async () => {
+      const email = uniqueEmail();
+      await registerUser(email);
+
+      const wrongPassword = await login(email, 'wrong-password-1');
+      const unknownEmail = await login(uniqueEmail(), 'wrong-password-1');
+
+      expect(wrongPassword.status).toBe(401);
+      expect(unknownEmail.status).toBe(401);
+      expect(unknownEmail.body).toEqual(wrongPassword.body);
+    });
+
+    it('should log in with a differently cased email', async () => {
+      const email = uniqueEmail();
+      await registerUser(email);
+      const typed = `  ${email.replace('@test.dev', '@TEST.DEV')} `;
+
+      const res = await login(typed, PASSWORD).expect(201);
+
+      expect(res.body.access_token).toEqual(expect.any(String));
     });
   });
 });
