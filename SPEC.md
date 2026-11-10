@@ -36,6 +36,10 @@ These are now part of the plan:
 | **G14. Explicit `null` on PATCH** (found in review) | `PartialType` applies `@IsOptional()`, which skips validation for `null` too. `PATCH /user/:id {"firstname": null}` reaches a NOT NULL column → 500; after Cycle 2, `{"password": null}` would reach `bcrypt.hash(null)` | `PartialType(CreateUserDto, { skipNullProperties: false })`: `null` is validated and rejected (400), omitted fields are still skipped. `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of its own `@IsOptional()`, which would otherwise keep skipping `isAdmin: null` on both `POST /user` and `PATCH` |
 | **G15. Zero-width-only names** (found in review) | `String.prototype.trim` doesn't strip U+200B and similar characters, so a name that looks blank is accepted | **Accepted**: cosmetic only, no security impact. Revisit if display names matter |
 | **G16. Unvalidated `JWT_SALT_OR_ROUNDS`** (found in review) | `Number(v) \|\| 10` only falls back for unset/`0`/non-numeric. `"1"`, `"4.5"` silently give bcrypt cost 4 (weak hashes); `"-1"`, `"20"`, `"31"` hang hashing, and concurrent password writes exhaust the libuv threadpool and stall logins | `UserService` reads it once at construction: unset or empty → 10; otherwise it must be an integer 10–15, else the constructor throws an `Error` naming `JWT_SALT_OR_ROUNDS` so the app fails at startup (a startup config error, not an HTTP error, so a plain `Error` is acceptable here) |
+| **G17. Out-of-range ids** (found in review) | `ParseIntPipe` accepts any integer, but `user.id` is a Postgres `integer`. `/user/2147483648` (pg 22003) and `/user/99999999999999999999999` (22P02) fail in `findOne`, outside the error mapping, so the client gets a 500. Nest's default handler then logs the full `QueryFailedError` | `ParseIdPipe` (`src/pipes/parse-id.pipe.ts`) delegates to `ParseIntPipe` (non-numeric → 400 `Validation failed (numeric string is expected)`), then rejects ids outside 1–2147483647 with 400 `Validation failed (id must be between 1 and 2147483647)`. `0` and negative ids change from 404 to 400 |
+| **G18. Any 23505 → 409** (found in review) | `email` is the only unique column besides the PK. A PK collision after sequence drift (manual seed, restore) would report "Email already in use" | **Accepted**: matching is by SQLSTATE code, not message text, so it is locale-independent. Revisit if another unique column is added; then match `driverError.constraint` against a named email constraint |
+| **G19. Unwrapped read paths log full DB errors** (found in review) | `findOne`, `findAll` and `findOneByEmail` (login) aren't wrapped by `toHttpError`. A DB failure there reaches Nest's `ExceptionsHandler`, which logs the whole `QueryFailedError`, including `parameters` (the submitted email on login). The response stays a generic 500 | **Follow-up**: a global exception filter that logs only name/message/stack, or wrap the reads |
+| **G20. Register 409 reveals registered emails** (found in review) | G6/DoD 4 require 409 on duplicate register, which partly undoes Cycle 3's enumeration fix for login | **Accepted by spec; follow-up**: rate limiting, or a neutral response plus email verification |
 
 ## Design decisions
 - **Global strict validation.** `APP_PIPE` = `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })` in `AppModule`, not `main.ts`, so e2e tests get it. The options live in `src/validation-pipe.options.ts` (`validationPipeOptions`) so a unit spec can exercise the same configuration.
@@ -45,7 +49,7 @@ These are now part of the plan:
 - **Hashing only in `UserService`** (`create` and `update`). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10), validated once at startup as an integer 10–15 (G16).
 - **`findOneByEmail` returns `User | null`.** Its only caller is `validateUser`.
 - **Unique violation** (`QueryFailedError`, `driverError.code === '23505'`) → `ConflictException`. Any other DB error → `InternalServerErrorException`. No bare `Error`s.
-- **`ParseIntPipe` on every `:id`** in `UserController`.
+- **`ParseIdPipe` on every `:id`** in `UserController`. It wraps `ParseIntPipe` and adds the Postgres `integer` range check (G17).
 
 ## TDD workflow
 For each cycle: **Red** — write the tests and run them to confirm they fail for the expected reason (not a compile error elsewhere), then commit `test(<scope>): ...`. **Green** — make the smallest change that passes them, then commit `fix(<scope>): ...`. **Refactor** — clean up with the tests still green. Run `npm test` (and `npm run test:e2e` where listed) at every Red and Green step.
@@ -149,10 +153,28 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
   - `PATCH /user/:id` returns the user without `password`.
   - `PATCH {}` → 400.
 
+**Decisions:**
+- **Empty `PATCH`.** A body with no defined fields gets `BadRequestException('No fields to update')` before any DB call or hashing. That's cheaper and doesn't depend on the user existing.
+- **500 logging.** It goes through `Logger` with the error's name, message and stack only, never TypeORM's `query`/`parameters` (they hold the email and the password hash). The response message is generic: `Failed to <create|update|remove> user`.
+- **HTTP exceptions** (e.g. `NotFoundException`) pass through the mapping unchanged.
+- **`signUp`.** Loses both its try/catch and its `if (!payload)` bare `Error`; the ValidationPipe guarantees a body. `UserService` errors propagate unchanged, so the old "throw an error for an invalid user" test is replaced by propagation tests.
+- **`findAll`'s dead `!users` check** stays; it's dead code (finding 10), out of scope.
+
 **Green**
 - `src/user/user.service.ts`: error mapping, `await` inside `try`, return `findOne(id)`, empty-DTO guard, `Logger` for 500s, and remove the dead `if (!user)` checks.
 - `src/auth/auth.service.ts`: remove the try/catch in `signUp`.
-- `src/user/user.controller.ts`: `ParseIntPipe`.
+- `src/user/user.controller.ts`: `ParseIdPipe` (new `src/pipes/parse-id.pipe.ts`, G17).
+- `toHttpError` returns `HttpException`, and non-`Error` throws are normalised before logging.
+
+**Review-driven test hardening:**
+- HTTP-exception passthrough.
+- A falsy-but-defined PATCH (`{ isAdmin: false }`).
+- 23505 vs. other codes, matched by code rather than message.
+- Log content and the absence of the query.
+- Hash and DB failures on update.
+- A plain `Error` propagating through `signUp`.
+- Recased `POST /user` 409.
+- Exact `ParseIntPipe` messages, and e2e id-range cases.
 
 ### Cycle 5: Remove sensitive logging (finding 6)
 **Red**
@@ -181,6 +203,7 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 - **New:**
   - `src/auth/dto/register.dto.ts`
   - `src/validation-pipe.options.ts` and `src/validation-pipe.options.spec.ts`
+  - `src/pipes/parse-id.pipe.ts` and `src/pipes/parse-id.pipe.spec.ts`
   - DTO specs ×3
   - `src/auth/jwt.strategy.spec.ts`, `src/auth/role.guard.spec.ts`
   - `test/auth-user.e2e-spec.ts`
@@ -195,14 +218,14 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
    - A non-numeric `:id` returns **400**, and so does an empty PATCH body.
    - `PATCH` returns the updated user without `password`.
    - No 500 response body contains DB error text.
-   - `grep -rn "new Error(" src` is empty.
+   - `grep -rn --exclude='*.spec.ts' "new Error(" src` matches only the G16 startup config check in `user.service.ts` (tests construct errors legitimately).
 5. `grep -rn "console.log" src` is empty.
 6. Every cycle has a `test:` commit that failed before its `fix:` commit. All of the following pass:
    - `npx eslint "{src,apps,libs,test}/**/*.ts"`
    - `npm test`
    - `npm run build`
    - `npm run test:e2e` (local DB)
-7. Follow-ups are recorded as issues: admin bootstrap (G9), rehash/audit/email-lowercasing of existing data (G10) and e2e in CI (G13).
+7. Follow-ups are recorded as issues: admin bootstrap (G9), rehash/audit/email-lowercasing of existing data (G10), e2e in CI (G13), logging on unwrapped read paths (G19) and register email enumeration (G20).
 
 ## Verification
 1. Per cycle: `npm test -- <pattern>` fails at Red and passes at Green. Capture both outputs in the PR Test Plan.

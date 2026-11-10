@@ -1,8 +1,4 @@
-import {
-  Injectable,
-  InternalServerErrorException,
-  OnModuleInit,
-} from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
 import { RegisterDto } from './dto/register.dto';
@@ -62,22 +58,7 @@ export class AuthService implements OnModuleInit {
   }
 
   async signUp(payload: RegisterDto): Promise<User> {
-    if (!payload) {
-      throw new Error('Invalid user data');
-    }
-
-    const data = {
-      ...payload,
-      isAdmin: false,
-    };
-
-    try {
-      return await this.usersService.create(data);
-    } catch (error) {
-      throw new InternalServerErrorException(
-        `Failed to create user: ${error.message}`,
-      );
-    }
+    return this.usersService.create({ ...payload, isAdmin: false });
   }
 
   async login(user: User) {
