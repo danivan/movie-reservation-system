@@ -86,6 +86,46 @@ describe('AuthService', () => {
       expect(user).toEqual(result);
     });
 
+    it('should create the user with isAdmin false when input sets isAdmin true', async () => {
+      // Loosely typed on purpose: RegisterDto has no isAdmin, but a caller
+      // bypassing validation must still not be able to self-promote.
+      const input: any = {
+        email: 'eve@example.com',
+        password: 'password123',
+        firstname: 'Eve',
+        lastname: 'Attacker',
+        isAdmin: true,
+      };
+      mockUserService.create = jest.fn().mockResolvedValue({ id: 1 });
+
+      await service.signUp(input);
+
+      expect(mockUserService.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          email: 'eve@example.com',
+          firstname: 'Eve',
+          lastname: 'Attacker',
+          isAdmin: false,
+        }),
+      );
+    });
+
+    it('should create the user with isAdmin false when input omits isAdmin', async () => {
+      const input: any = {
+        email: 'jane@example.com',
+        password: 'password123',
+        firstname: 'Jane',
+        lastname: 'Doe',
+      };
+      mockUserService.create = jest.fn().mockResolvedValue({ id: 2 });
+
+      await service.signUp(input);
+
+      expect(mockUserService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ isAdmin: false }),
+      );
+    });
+
     it('should throw an error for an invalid user', async () => {
       mockUserService.create = jest
         .fn()

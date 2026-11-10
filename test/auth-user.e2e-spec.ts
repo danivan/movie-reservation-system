@@ -74,4 +74,56 @@ describe('Auth & User (e2e)', () => {
       expect(Array.isArray(res.body)).toBe(true);
     });
   });
+
+  describe('POST /auth/register', () => {
+    const makeRegisterBody = (overrides: Record<string, unknown> = {}) => ({
+      firstname: 'Jane',
+      lastname: 'Doe',
+      email: uniqueEmail(),
+      password: PASSWORD,
+      ...overrides,
+    });
+
+    it('should reject isAdmin in the body with 400', async () => {
+      await register(makeRegisterBody({ isAdmin: true })).expect(400);
+    });
+
+    it('should not create a user when the body contains isAdmin', async () => {
+      const email = uniqueEmail();
+
+      await register(makeRegisterBody({ email, isAdmin: true }));
+
+      const row = await dataSource.getRepository(User).findOneBy({ email });
+      expect(row).toBeNull();
+    });
+
+    it('should reject an invalid email with 400', async () => {
+      // Keeps the run prefix so cleanup still catches it if it is ever saved.
+      const email = uniqueEmail().replace('@', '-at-');
+
+      await register(makeRegisterBody({ email })).expect(400);
+    });
+
+    it('should reject a password shorter than 8 characters with 400', async () => {
+      await register(makeRegisterBody({ password: 'x'.repeat(7) })).expect(400);
+    });
+
+    it('should register a valid user with 201 as a non-admin', async () => {
+      const res = await register(makeRegisterBody()).expect(201);
+
+      expect(res.body.isAdmin).toBe(false);
+    });
+
+    it('should not expose the password in the response body', async () => {
+      const res = await register(makeRegisterBody()).expect(201);
+
+      expect(res.body).not.toHaveProperty('password');
+    });
+  });
+
+  describe('POST /auth/login', () => {
+    it('should reject an empty body with 401', async () => {
+      await request(server()).post('/auth/login').send({}).expect(401);
+    });
+  });
 });
