@@ -36,9 +36,10 @@ These are now part of the plan:
 | **G14. Explicit `null` on PATCH** (found in review) | `PartialType` applies `@IsOptional()`, which skips validation for `null` too. `PATCH /user/:id {"firstname": null}` reaches a NOT NULL column → 500; after Cycle 2, `{"password": null}` would reach `bcrypt.hash(null)` | `PartialType(CreateUserDto, { skipNullProperties: false })`: `null` is validated and rejected (400), omitted fields are still skipped. `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of its own `@IsOptional()`, which would otherwise keep skipping `isAdmin: null` on both `POST /user` and `PATCH` |
 | **G15. Zero-width-only names** (found in review) | `String.prototype.trim` doesn't strip U+200B and similar characters, so a name that looks blank is accepted | **Accepted**: cosmetic only, no security impact. Revisit if display names matter |
 | **G16. Unvalidated `JWT_SALT_OR_ROUNDS`** (found in review) | `Number(v) \|\| 10` only falls back for unset/`0`/non-numeric. `"1"`, `"4.5"` silently give bcrypt cost 4 (weak hashes); `"-1"`, `"20"`, `"31"` hang hashing, and concurrent password writes exhaust the libuv threadpool and stall logins | `UserService` reads it once at construction: unset or empty → 10; otherwise it must be an integer 10–15, else the constructor throws an `Error` naming `JWT_SALT_OR_ROUNDS` so the app fails at startup (a startup config error, not an HTTP error, so a plain `Error` is acceptable here) |
-| **G17. Out-of-range ids** (found in review) | `ParseIntPipe` accepts any integer, but `user.id` is a Postgres `integer`. `/user/2147483648` (pg 22003) and `/user/99999999999999999999999` (22P02) fail in `findOne`, outside the error mapping, so the client gets a 500. Nest's default handler then logs the full `QueryFailedError` | `ParseIdPipe` (`src/pipes/parse-id.pipe.ts`) delegates to `ParseIntPipe` (non-numeric → 400 `Validation failed (numeric string is expected)`), then rejects ids outside 1–2147483647 with 400 `Validation failed (id must be between 1 and 2147483647)`. `0` and negative ids change from 404 to 400 |
+| **G17. Out-of-range ids** (found in review) | `ParseIntPipe` accepts any integer, but `user.id` is a Postgres `integer`. `/user/2147483648` (pg 22003) and `/user/99999999999999999999999` (22P02) fail in `findOne`, outside the error mapping, so the client gets a 500. Nest's default handler then logs the full `QueryFailedError` | `ParseIdPipe` (`src/pipes/parse-id.pipe.ts`) delegates to `ParseIntPipe` (non-numeric → 400 `Validation failed (numeric string is expected)`), then rejects ids outside 1–2147483647 with 400 `Validation failed (id must be between 1 and 2147483647)`. `0` and negative ids change from 404 to 400. **Found in the full-branch review:** with `transform: true`, the global `ValidationPipe` coerced `@Param` values typed `number` with `+value` before `ParseIdPipe` ran, so `0x10` was accepted as 16 and `1e3` as 1000. The id now comes from a custom `@IdParam()` decorator (`src/decorators/id-param.decorator.ts`), which the global pipe skips, so `ParseIdPipe` sees the raw string and only decimal digits pass |
 | **G18. Any 23505 → 409** (found in review) | `email` is the only unique column besides the PK. A PK collision after sequence drift (manual seed, restore) would report "Email already in use" | **Accepted**: matching is by SQLSTATE code, not message text, so it is locale-independent. Revisit if another unique column is added; then match `driverError.constraint` against a named email constraint |
-| **G19. Unwrapped read paths log full DB errors** (found in review) | `findOne`, `findAll` and `findOneByEmail` (login) aren't wrapped by `toHttpError`. A DB failure there reaches Nest's `ExceptionsHandler`, which logs the whole `QueryFailedError`, including `parameters` (the submitted email on login). The response stays a generic 500 | **Follow-up**: a global exception filter that logs only name/message/stack, or wrap the reads |
+| **G19. Unwrapped read paths log full DB errors** (found in review) | `findOne`, `findAll` and `findOneByEmail` (login) aren't wrapped by `toHttpError`. A DB failure there reaches Nest's `ExceptionsHandler`, which logs the whole `QueryFailedError`, including `parameters` (the submitted email on login). The response stays a generic 500 | **Follow-up**: a global exception filter that logs only name/message/stack, or wrap the reads. The full-branch review found a client could trigger this on demand by sending a NUL byte in the login email (Postgres 22021). That path is now closed: `validateUser` rejects NUL, and the name DTOs reject NUL (G21). So what remains needs a genuine DB failure |
+| **G21. NUL bytes → 500** (found in full-branch review) | Postgres `text`/`varchar` rejects U+0000. A NUL in `firstname`/`lastname` passed validation, and the insert or update returned 500. A NUL in the login email reached `findOneByEmail` and returned 500, logging the full error (G19) | `@Matches(/^[^\u0000]*$/)` on `firstname`/`lastname` (inherited by `RegisterDto`/`UpdateUserDto`), so 400. `validateUser` returns `null` for an email containing NUL, so 401. Emails in DTOs were already safe (`@IsEmail` rejects NUL). **Passwords too** (full-branch test review): native bcrypt hashes an all-NUL password the same as an empty one, so `compare('\0', hash('\0'.repeat(8)))` is `true`. `password` gets the same no-NUL rule |
 | **G20. Register 409 reveals registered emails** (found in review) | G6/DoD 4 require 409 on duplicate register, which partly undoes Cycle 3's enumeration fix for login | **Accepted by spec; follow-up**: rate limiting, or a neutral response plus email verification |
 
 ## Design decisions
@@ -46,7 +47,7 @@ These are now part of the plan:
 - **Names are trimmed.** `firstname`/`lastname` get a trim `@Transform`, so whitespace-only names fail `@IsNotEmpty()`.
 - **`UpdateUserDto`** = `PartialType(CreateUserDto, { skipNullProperties: false })`, so omitted fields are optional but `null` is rejected (G14).
 - **`RegisterDto`** = `OmitType(CreateUserDto, ['isAdmin'] as const)`. `signUp` also forces `isAdmin: false`.
-- **Hashing only in `UserService`** (`create` and `update`). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10), validated once at startup as an integer 10–15 (G16).
+- **Hashing only in `UserService`** (`create`, `update`, and the public `hashPassword` that `AuthService` uses for the dummy hash). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10), validated once at startup as an integer 10–15 (G16).
 - **`findOneByEmail` returns `User | null`.** Its only caller is `validateUser`.
 - **Unique violation** (`QueryFailedError`, `driverError.code === '23505'`) → `ConflictException`. Any other DB error → `InternalServerErrorException`. No bare `Error`s on request paths; the G16 startup check is the only exception.
 - **`ParseIdPipe` on every `:id`** in `UserController`. It wraps `ParseIntPipe` and adds the Postgres `integer` range check (G17).
@@ -198,10 +199,10 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 
 ### Final refactor
 - Run `npm run format` and `npx eslint "{src,apps,libs,test}/**/*.ts"`.
-- Update CLAUDE.md, and commit it, since it is currently untracked:
+- Update CLAUDE.md and commit it. It was untracked before this branch; it was committed in `7f3f21d`.
   - The Architecture notes on global validation (including `src/validation-pipe.options.ts`), `RegisterDto`, `src/pipes/` and where hashing lives.
   - The env table: `JWT_SALT_OR_ROUNDS` is read by `UserService`, must be an integer 10–15, and stops startup otherwise.
-  - The Testing section: `jest.resetAllMocks()` plus re-stubbing replaces `clearAllMocks`.
+  - The Testing section: `jest.resetAllMocks()` plus re-stubbing replaces `clearAllMocks` in every spec. The two controller specs were aligned after the full-branch review.
 
 ## Files touched (summary)
 - **Modified:**
@@ -217,6 +218,7 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
   - `src/auth/dto/register.dto.ts`
   - `src/validation-pipe.options.ts` and `src/validation-pipe.options.spec.ts`
   - `src/pipes/parse-id.pipe.ts` and `src/pipes/parse-id.pipe.spec.ts`
+  - `src/decorators/id-param.decorator.ts` (full-branch review, G17)
   - DTO specs ×3
   - `src/auth/jwt.strategy.spec.ts`, `src/auth/role.guard.spec.ts`
   - `test/auth-user.e2e-spec.ts` and `test/utils/spy-on-logging.ts`
