@@ -23,10 +23,10 @@ export class UserService {
   constructor(
     @InjectRepository(User)
     private userRepository: Repository<User>,
-    private readonly configService: ConfigService,
+    configService: ConfigService,
   ) {
-    const raw = this.configService.get<string>('JWT_SALT_OR_ROUNDS');
-    if (raw === undefined || raw === null || raw === '') {
+    const raw = configService.get<string>('JWT_SALT_OR_ROUNDS');
+    if (raw === undefined || raw === '') {
       this.saltRounds = 10;
       return;
     }

@@ -38,6 +38,10 @@ export class AuthService implements OnModuleInit {
     if (typeof email !== 'string' || typeof pass !== 'string') {
       return null;
     }
+    // Postgres rejects U+0000 in text, so the lookup would 500.
+    if (email.includes('\u0000')) {
+      return null;
+    }
 
     const normalised = email.trim().toLowerCase();
     const user = await this.usersService.findOneByEmail(normalised);
