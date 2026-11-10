@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ParseIntPipe } from '@nestjs/common';
 import { ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
+import { ParseIdPipe } from 'src/pipes/parse-id.pipe';
 import { UserController } from './user.controller';
 import { UserService } from './user.service';
 
@@ -39,9 +39,13 @@ describe('UserController', () => {
 
   describe('id param', () => {
     it.each(['findOne', 'update', 'remove'])(
-      'should parse the id of %s with ParseIntPipe',
+      'should parse the id of %s with ParseIdPipe',
       (method) => {
-        expect(idParamPipes(method)).toContain(ParseIntPipe);
+        const pipes = idParamPipes(method);
+
+        expect(
+          pipes.some((p) => p === ParseIdPipe || p instanceof ParseIdPipe),
+        ).toBe(true);
       },
     );
   });

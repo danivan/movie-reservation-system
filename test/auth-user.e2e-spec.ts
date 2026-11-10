@@ -12,6 +12,12 @@ const PASSWORD = 'password123';
 let emailSeq = 0;
 const uniqueEmail = () => `${RUN_PREFIX}${emailSeq++}@test.dev`;
 
+const NUMERIC_ID_MESSAGE = 'Validation failed (numeric string is expected)';
+const ID_RANGE_MESSAGE =
+  'Validation failed (id must be between 1 and 2147483647)';
+// One past the Postgres `integer` max.
+const OUT_OF_RANGE_ID = '2147483648';
+
 describe('Auth & User (e2e)', () => {
   let app: INestApplication;
   let dataSource: DataSource;
@@ -214,24 +220,26 @@ describe('Auth & User (e2e)', () => {
       expect(row.password).not.toBe(PASSWORD);
     });
 
-    it('should return 409 for a duplicate email', async () => {
+    it('should return 409 for a duplicate email in a different case', async () => {
       const email = uniqueEmail();
-      const createUser = () =>
+      const recased = email.replace('@test.dev', '@TEST.DEV');
+      const createUser = (address: string) =>
         authed(
           request(server()).post('/user').send({
             firstname: 'Dee',
             lastname: 'Duplicate',
-            email,
+            email: address,
             password: PASSWORD,
           }),
           adminToken,
         );
-      await createUser().expect(201);
+      await createUser(email).expect(201);
 
-      const res = await createUser().expect(409);
+      const res = await createUser(recased).expect(409);
 
       expect(res.body.message).toBe('Email already in use');
       expect(JSON.stringify(res.body)).not.toContain(email);
+      expect(JSON.stringify(res.body)).not.toContain(recased);
     });
   });
 
@@ -354,16 +362,52 @@ describe('Auth & User (e2e)', () => {
     });
 
     it('should return 400 for a non-numeric id', async () => {
-      await authed(
+      const res = await authed(
         request(server()).patch('/user/abc').send({ firstname: 'Abc' }),
         adminToken,
       ).expect(400);
+
+      expect(res.body.message).toBe(NUMERIC_ID_MESSAGE);
+    });
+
+    it('should return 400 for an id above the Postgres integer max', async () => {
+      const path = `/user/${OUT_OF_RANGE_ID}`;
+
+      const res = await authed(
+        request(server()).patch(path).send({ firstname: 'Big' }),
+        adminToken,
+      ).expect(400);
+
+      expect(res.body.message).toBe(ID_RANGE_MESSAGE);
     });
   });
 
   describe('GET /user/:id', () => {
     it('should return 400 for a non-numeric id', async () => {
-      await authed(request(server()).get('/user/abc'), adminToken).expect(400);
+      const res = await authed(
+        request(server()).get('/user/abc'),
+        adminToken,
+      ).expect(400);
+
+      expect(res.body.message).toBe(NUMERIC_ID_MESSAGE);
+    });
+
+    it('should return 400 for an id above the Postgres integer max', async () => {
+      const res = await authed(
+        request(server()).get(`/user/${OUT_OF_RANGE_ID}`),
+        adminToken,
+      ).expect(400);
+
+      expect(res.body.message).toBe(ID_RANGE_MESSAGE);
+    });
+
+    it('should return 400 for id 0', async () => {
+      const res = await authed(
+        request(server()).get('/user/0'),
+        adminToken,
+      ).expect(400);
+
+      expect(res.body.message).toBe(ID_RANGE_MESSAGE);
     });
 
     it('should return the user without password', async () => {
@@ -384,7 +428,17 @@ describe('Auth & User (e2e)', () => {
     it('should return 400 for a non-numeric id', async () => {
       const req = request(server()).delete('/user/abc');
 
-      await authed(req, adminToken).expect(400);
+      const res = await authed(req, adminToken).expect(400);
+
+      expect(res.body.message).toBe(NUMERIC_ID_MESSAGE);
+    });
+
+    it('should return 400 for an id above the Postgres integer max', async () => {
+      const req = request(server()).delete(`/user/${OUT_OF_RANGE_ID}`);
+
+      const res = await authed(req, adminToken).expect(400);
+
+      expect(res.body.message).toBe(ID_RANGE_MESSAGE);
     });
 
     it('should delete a user', async () => {

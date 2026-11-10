@@ -316,9 +316,44 @@ describe('UserService', () => {
         .flat()
         .map(stringifyLogArg)
         .join('\n');
+      expect(logged).toContain('QueryFailedError');
+      expect(logged).toContain('internal error');
+      expect(logged).not.toContain('INSERT INTO');
       expect(logged).not.toContain(SECRET_EMAIL);
       expect(logged).not.toContain(SECRET_HASH);
     });
+
+    it('should rethrow HttpExceptions unchanged', async () => {
+      const err = new ConflictException('x');
+      mockUserRepository.save.mockRejectedValue(err);
+
+      await expect(service.create(makeCreateUserDto())).rejects.toBe(err);
+    });
+
+    it.each([
+      {
+        code: '23505',
+        message: 'doublon',
+        type: ConflictException,
+        expected: 'Email already in use',
+      },
+      {
+        code: '23503',
+        message: 'duplicate key value violates unique constraint',
+        type: InternalServerErrorException,
+        expected: 'Failed to create user',
+      },
+    ])(
+      'should map driver code $code with message $message to $expected',
+      async ({ code, message, type, expected }) => {
+        mockUserRepository.save.mockRejectedValue(queryFailed(code, message));
+
+        const result = service.create(makeCreateUserDto());
+
+        await expect(result).rejects.toBeInstanceOf(type);
+        await expect(result).rejects.toMatchObject({ message: expected });
+      },
+    );
   });
 
   describe('update', () => {
@@ -425,6 +460,48 @@ describe('UserService', () => {
       });
       await expect(result).rejects.toMatchObject({
         message: expect.not.stringContaining('connection refused'),
+      });
+    });
+
+    it('should throw a generic InternalServerErrorException for a non-unique QueryFailedError', async () => {
+      mockUserRepository.update.mockRejectedValue(
+        queryFailed('XX000', 'internal error'),
+      );
+
+      const result = service.update(1, { firstname: 'Jane' });
+
+      await expect(result).rejects.toBeInstanceOf(InternalServerErrorException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Failed to update user',
+      });
+    });
+
+    it('should throw a generic InternalServerErrorException when hashing fails', async () => {
+      (bcrypt.hash as jest.Mock).mockRejectedValue(new Error(DB_TEXT));
+
+      const result = service.update(1, { password: 'new-password' });
+
+      await expect(result).rejects.toBeInstanceOf(InternalServerErrorException);
+      await expect(result).rejects.toMatchObject({
+        message: 'Failed to update user',
+      });
+      expect(mockUserRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('should rethrow HttpExceptions unchanged', async () => {
+      const err = new ConflictException('x');
+      mockUserRepository.update.mockRejectedValue(err);
+
+      await expect(service.update(1, { firstname: 'Jane' })).rejects.toBe(err);
+    });
+
+    it('should accept a dto whose only field is falsy but defined', async () => {
+      await expect(service.update(1, { isAdmin: false })).resolves.toEqual(
+        makeUser(),
+      );
+
+      expect(mockUserRepository.update).toHaveBeenCalledWith(1, {
+        isAdmin: false,
       });
     });
   });

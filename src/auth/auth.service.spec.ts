@@ -1,9 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from './auth.service';
-import {
-  ConflictException,
-  InternalServerErrorException,
-} from '@nestjs/common';
+import { ConflictException } from '@nestjs/common';
 import { UserService } from 'src/user/user.service';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -364,7 +361,7 @@ describe('AuthService', () => {
     });
 
     it('should propagate other errors unchanged', async () => {
-      const err = new InternalServerErrorException('Failed to create user');
+      const err = new Error('boom');
       mockUserService.create.mockRejectedValueOnce(err);
 
       await expect(
