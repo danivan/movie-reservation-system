@@ -9,11 +9,11 @@ A review of the request flow found these defects in the auth and user routes:
 | 2 | `POST /user` and `PATCH /user/:id` store `password` without hashing | Plaintext passwords in the DB; those users can't log in |
 | 3 | Login with an unknown email throws `NotFoundException` | Returns 404 instead of 401, which reveals which emails are registered |
 | 4 | Wrong status codes and return values | Duplicate email → 500, `/user/abc` → 500, `PATCH` returns `UpdateResult`, bare `Error`s → 500 |
-| 6 | `console.log` in `JwtStrategy` and `RolesGuard` | JWT payloads and user data (emails) logged on every request |
+| 6 | `console.log` in `JwtStrategy` and `RolesGuard` | JWT payloads and user data (emails) logged on every authenticated request (`JwtStrategy`) and every `@Roles` route (`RolesGuard`) |
 
 Out of scope: finding 5 (role taken from the JWT / `GET /user` open to all users) and finding 10 (dead code).
 
-Branch: `feature/JIRA-<id>-harden-auth-user`. Conventional Commits.
+Branch: `feature/JIRA-<id>-harden-auth-user`, currently `feature/harden-auth-user` until a JIRA id is assigned; rename before opening the PR. Conventional Commits.
 
 ## Gaps found while reviewing the first draft of this plan
 These are now part of the plan:
@@ -23,7 +23,7 @@ These are now part of the plan:
 | **G1. Silent admin demotion.** `PartialType` from `@nestjs/mapped-types` copies property initializers (`inheritPropertyInitializers`). Once `ValidationPipe({ transform: true })` runs, `PATCH {"password": "..."}` becomes `{password, isAdmin: false}` | Any password change would demote an admin | Remove the `= false` initializer from `CreateUserDto` (the entity column already defaults to `false`). Add a test that a transformed `UpdateUserDto` has no `isAdmin` key |
 | **G2. Email case.** The unique constraint is case-sensitive | `A@x.dev` and `a@x.dev` become two accounts, so the 409 check is bypassable, and login is case-sensitive | `@Transform` trim + lowercase on `email` in the DTO; lowercase `username` in `validateUser` |
 | **G3. bcrypt truncates at 72 bytes** | Long passwords silently match on their first 72 bytes | `@MaxLength(72)` on `password` |
-| **G4. Empty PATCH body** (`{}`) | TypeORM throws `UpdateValuesMissingError` → 500 | `update` throws `BadRequestException('No fields to update')` when the DTO has no keys |
+| **G4. Empty PATCH body** (`{}`) | TypeORM throws `UpdateValuesMissingError` → 500 | `update` throws `BadRequestException('No fields to update')` when no field in the DTO is defined |
 | **G5. DB internals leak in 500 messages** (`` `Failed to ...: ${error.message}` ``) | Leaks SQL and constraint details to clients | Generic 500 message. Log the error with Nest `Logger` (no request body or PII) |
 | **G6. 409 message** | Must not echo the email | `ConflictException('Email already in use')` |
 | **G7. Timing-based enumeration** after the 404→401 fix | Unknown emails respond faster (no bcrypt work) | Compare against a dummy hash generated once with the same salt rounds. It is started at startup (`onModuleInit`, not awaited) so the first unknown-email login isn't measurably slower (review measured 123 ms vs ~50 ms when lazy). A failed hash is not cached, so it is retried rather than turning every unknown email into a 500. **Residual (accepted, see G10):** accounts hashed at a different cost, or still holding plaintext passwords, respond at a different speed |
@@ -48,7 +48,7 @@ These are now part of the plan:
 - **`RegisterDto`** = `OmitType(CreateUserDto, ['isAdmin'] as const)`. `signUp` also forces `isAdmin: false`.
 - **Hashing only in `UserService`** (`create` and `update`). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10), validated once at startup as an integer 10–15 (G16).
 - **`findOneByEmail` returns `User | null`.** Its only caller is `validateUser`.
-- **Unique violation** (`QueryFailedError`, `driverError.code === '23505'`) → `ConflictException`. Any other DB error → `InternalServerErrorException`. No bare `Error`s.
+- **Unique violation** (`QueryFailedError`, `driverError.code === '23505'`) → `ConflictException`. Any other DB error → `InternalServerErrorException`. No bare `Error`s on request paths; the G16 startup check is the only exception.
 - **`ParseIdPipe` on every `:id`** in `UserController`. It wraps `ParseIntPipe` and adds the Postgres `integer` range check (G17).
 
 ## TDD workflow
@@ -174,22 +174,34 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 - Hash and DB failures on update.
 - A plain `Error` propagating through `signUp`.
 - Recased `POST /user` 409.
-- Exact `ParseIntPipe` messages, and e2e id-range cases.
+- Exact `ParseIdPipe` messages (the delegated numeric message and the range message), and e2e id-range cases.
 
 ### Cycle 5: Remove sensitive logging (finding 6)
 **Red**
-- `src/auth/jwt.strategy.spec.ts` (new): `validate` maps the payload and does **not** call `console.log` (`jest.spyOn(console, 'log')`).
+- `src/auth/jwt.strategy.spec.ts` (new):
+  - `validate` maps admin and non-admin payloads exactly (`isAdmin: false` catches a hard-coded admin flag).
+  - `JWT_SECRET` is read with `getOrThrow`.
+  - Nothing is logged.
 - `src/auth/role.guard.spec.ts` (new):
-  - Admin is allowed and non-admin is denied on `@Roles(ADMIN)`.
+  - Admin is allowed and non-admin is denied on `@Roles(ADMIN)`; a non-admin is allowed on `@Roles(USER)`.
   - No `@Roles` → allowed.
-  - `console.log` is not called.
+  - Nothing is logged.
+- E2E: an authenticated admin `GET /user` and `PATCH /user/:id` log nothing.
+- **"Nothing is logged"** means no call on any `console` method or Nest `Logger` method. It uses a shared helper, `test/utils/spy-on-logging.ts`, added after review because a `console.log`-only spy missed other channels.
 
 **Green**
 - Delete the `console.log` lines in `src/auth/jwt.strategy.ts` and `src/auth/role.guard.ts`.
 
+**Follow-ups found in review (not this cycle):**
+- `RolesGuard` throws a 500 if `user` is missing on a `@Roles` route. That's unreachable today, because the global `JwtAuthGuard` runs first. Use `user?.isAdmin`, and deny.
+- An admin is denied on a `@Roles(Role.USER)` route, and an empty `@Roles()` denies everyone. Decide the intended behaviour before any route uses `Role.USER`.
+
 ### Final refactor
 - Run `npm run format` and `npx eslint "{src,apps,libs,test}/**/*.ts"`.
-- Update the CLAUDE.md Architecture notes on global validation (including `src/validation-pipe.options.ts`), `RegisterDto` and where hashing lives.
+- Update CLAUDE.md, and commit it, since it is currently untracked:
+  - The Architecture notes on global validation (including `src/validation-pipe.options.ts`), `RegisterDto`, `src/pipes/` and where hashing lives.
+  - The env table: `JWT_SALT_OR_ROUNDS` is read by `UserService`, must be an integer 10–15, and stops startup otherwise.
+  - The Testing section: `jest.resetAllMocks()` plus re-stubbing replaces `clearAllMocks`.
 
 ## Files touched (summary)
 - **Modified:**
@@ -199,14 +211,15 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
   - `src/auth/auth.service.ts`, `src/auth/jwt.strategy.ts`, `src/auth/role.guard.ts`
   - `src/user/user.service.ts`, `src/user/user.controller.ts`, `src/user/dto/create-user.dto.ts`, `src/user/dto/update-user.dto.ts`
   - Existing specs: `auth.service`, `user.service`, `user.controller`, `app.controller`
-  - `CLAUDE.md`
 - **New:**
+  - `SPEC.md` (this file)
+  - `CLAUDE.md` (previously untracked; committed with the final refactor)
   - `src/auth/dto/register.dto.ts`
   - `src/validation-pipe.options.ts` and `src/validation-pipe.options.spec.ts`
   - `src/pipes/parse-id.pipe.ts` and `src/pipes/parse-id.pipe.spec.ts`
   - DTO specs ×3
   - `src/auth/jwt.strategy.spec.ts`, `src/auth/role.guard.spec.ts`
-  - `test/auth-user.e2e-spec.ts`
+  - `test/auth-user.e2e-spec.ts` and `test/utils/spy-on-logging.ts`
 - **Removed:** `test/app.e2e-spec.ts`, replaced by the new suite.
 
 ## Definition of done
@@ -219,13 +232,13 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
    - `PATCH` returns the updated user without `password`.
    - No 500 response body contains DB error text.
    - `grep -rn --exclude='*.spec.ts' "new Error(" src` matches only the G16 startup config check in `user.service.ts` (tests construct errors legitimately).
-5. `grep -rn "console.log" src` is empty.
+5. `grep -rn "console.log" src` is empty (the specs use spy variables), and `grep -rn --exclude='*.spec.ts' "console\." src` is empty.
 6. Every cycle has a `test:` commit that failed before its `fix:` commit. All of the following pass:
    - `npx eslint "{src,apps,libs,test}/**/*.ts"`
    - `npm test`
    - `npm run build`
    - `npm run test:e2e` (local DB)
-7. Follow-ups are recorded as issues: admin bootstrap (G9), rehash/audit/email-lowercasing of existing data (G10), e2e in CI (G13), logging on unwrapped read paths (G19) and register email enumeration (G20).
+7. Follow-ups are recorded as issues: admin bootstrap (G9), rehash/audit/email-lowercasing of existing data (G10), e2e in CI (G13), logging on unwrapped read paths (G19), register email enumeration (G20), and the two `RolesGuard` follow-ups from Cycle 5 (missing user, admin on `Role.USER` routes). List them in the PR description.
 
 ## Verification
 1. Per cycle: `npm test -- <pattern>` fails at Red and passes at Green. Capture both outputs in the PR Test Plan.
