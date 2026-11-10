@@ -1,3 +1,4 @@
+import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from './auth.service';
 import { InternalServerErrorException } from '@nestjs/common';
 import { UserService } from 'src/user/user.service';
@@ -33,18 +34,29 @@ describe('AuthService', () => {
     ...overrides,
   });
 
-  beforeEach(() => {
-    jest.clearAllMocks();
+  beforeEach(async () => {
+    // resetAllMocks (not clearAllMocks) so no implementation or *Once queue
+    // leaks from one test into the next; every default is re-stubbed below.
+    jest.resetAllMocks();
     (bcrypt.hash as jest.Mock).mockResolvedValue('hashed-pw');
     (bcrypt.compare as jest.Mock).mockResolvedValue(false);
-    mockConfigService.get.mockReturnValue(undefined);
-    mockUserService.create.mockResolvedValue({ id: 1 });
-
-    service = new AuthService(
-      mockUserService as unknown as UserService,
-      mockJwtService as unknown as JwtService,
-      mockConfigService as unknown as ConfigService,
+    mockConfigService.get.mockImplementation(
+      (_key: string, def?: unknown) => def,
     );
+    mockUserService.findOneByEmail.mockResolvedValue(null);
+    mockUserService.create.mockResolvedValue({ id: 1 });
+    mockJwtService.sign.mockReturnValue('signed-token');
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        AuthService,
+        { provide: UserService, useValue: mockUserService },
+        { provide: JwtService, useValue: mockJwtService },
+        { provide: ConfigService, useValue: mockConfigService },
+      ],
+    }).compile();
+
+    service = module.get<AuthService>(AuthService);
   });
 
   it('should be defined', () => {

@@ -169,7 +169,7 @@ describe('Auth & User (e2e)', () => {
     it('should store a bcrypt hash and let the created user log in', async () => {
       const email = uniqueEmail();
 
-      await authed(
+      const created = await authed(
         request(server()).post('/user').send({
           firstname: 'Carl',
           lastname: 'Created',
@@ -178,6 +178,7 @@ describe('Auth & User (e2e)', () => {
         }),
         adminToken,
       ).expect(201);
+      expect(created.body).not.toHaveProperty('password');
 
       const res = await login(email, PASSWORD).expect(201);
       expect(res.body.access_token).toEqual(expect.any(String));
@@ -208,10 +209,15 @@ describe('Auth & User (e2e)', () => {
 
     it('should hash a new password so the user can log in with it', async () => {
       const email = uniqueEmail();
-      const user = await registerUser(email);
+      const before = await registerUser(email);
 
-      await patchUser(user.id, { password: NEW_PASSWORD }).expect(200);
+      await patchUser(before.id, { password: NEW_PASSWORD }).expect(200);
 
+      const after = await dataSource
+        .getRepository(User)
+        .findOneByOrFail({ id: before.id });
+      expect(after.password).toMatch(/^\$2[aby]\$/);
+      expect(after.password).not.toBe(before.password);
       const res = await login(email, NEW_PASSWORD).expect(201);
       expect(res.body.access_token).toEqual(expect.any(String));
       await login(email, PASSWORD).expect(401);
@@ -223,6 +229,11 @@ describe('Auth & User (e2e)', () => {
       await dataSource
         .getRepository(User)
         .update({ id: user.id }, { isAdmin: true });
+      // Precondition: the user really is an admin before the PATCH.
+      const promoted = await dataSource
+        .getRepository(User)
+        .findOneByOrFail({ id: user.id });
+      expect(promoted.isAdmin).toBe(true);
 
       await patchUser(user.id, { password: NEW_PASSWORD }).expect(200);
 

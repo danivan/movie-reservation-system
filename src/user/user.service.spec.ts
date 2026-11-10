@@ -6,6 +6,7 @@ import * as bcrypt from 'bcrypt';
 import { UserService } from './user.service';
 import { User } from './entities/user.entity';
 import { CreateUserDto } from './dto/create-user.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
 
 jest.mock('bcrypt');
 
@@ -33,6 +34,24 @@ describe('UserService', () => {
     ...overrides,
   });
 
+  const makeUser = (overrides: Partial<User> = {}): User => ({
+    id: 1,
+    email: 'john@example.com',
+    password: 'stored-hash',
+    firstname: 'John',
+    lastname: 'Doe',
+    isAdmin: false,
+    ...overrides,
+  });
+
+  // Makes the config mock return `value` for JWT_SALT_OR_ROUNDS; any other
+  // key falls back to the default passed to get(key, default).
+  const setSaltRounds = (value: string) => {
+    mockConfigService.get.mockImplementation((key: string, def?: unknown) =>
+      key === 'JWT_SALT_OR_ROUNDS' ? value : def,
+    );
+  };
+
   const buildService = async (): Promise<UserService> => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -46,12 +65,26 @@ describe('UserService', () => {
   };
 
   beforeEach(async () => {
-    jest.clearAllMocks();
-    (bcrypt.hash as jest.Mock).mockResolvedValue('hashed-pw');
+    // resetAllMocks (not clearAllMocks) so no implementation or *Once queue
+    // leaks from one test into the next; every default is re-stubbed below.
+    jest.resetAllMocks();
+    // Output depends on the input, so a double hash or a wrong rounds value
+    // produces a different string than the one asserted.
+    (bcrypt.hash as jest.Mock).mockImplementation(
+      async (plain: string, rounds: number) => `hashed(${plain},${rounds})`,
+    );
     // No JWT_SALT_OR_ROUNDS configured by default, so the fallback (10) applies.
-    mockConfigService.get.mockReturnValue(undefined);
+    mockConfigService.get.mockImplementation(
+      (_key: string, def?: unknown) => def,
+    );
     // Pass-through so whatever the service hands to create() reaches save().
     mockUserRepository.create.mockImplementation((data) => ({ ...data }));
+    mockUserRepository.save.mockImplementation(async (entity) => ({
+      id: 1,
+      ...entity,
+    }));
+    mockUserRepository.findOneBy.mockResolvedValue(makeUser());
+    mockUserRepository.update.mockResolvedValue({ affected: 1 });
 
     service = await buildService();
   });
@@ -60,9 +93,64 @@ describe('UserService', () => {
     expect(service).toBeDefined();
   });
 
+  describe('constructor', () => {
+    it.each(['9', '16', '1', '0', '-1', '4.5', 'abc', '1e9', 'Infinity'])(
+      'should fail to build when JWT_SALT_OR_ROUNDS is %p',
+      async (value) => {
+        setSaltRounds(value);
+
+        await expect(buildService()).rejects.toThrow(/JWT_SALT_OR_ROUNDS/);
+      },
+    );
+
+    it.each([
+      ['10', 10],
+      ['12', 12],
+      ['15', 15],
+    ])(
+      'should build with JWT_SALT_OR_ROUNDS %p and hash with %p rounds on create',
+      async (value, rounds) => {
+        setSaltRounds(value);
+        const configuredService = await buildService();
+
+        await configuredService.create(makeCreateUserDto());
+
+        expect(bcrypt.hash).toHaveBeenCalledWith('plain-password', rounds);
+      },
+    );
+
+    it('should default to 10 rounds when JWT_SALT_OR_ROUNDS is unset', async () => {
+      await service.create(makeCreateUserDto());
+
+      expect(bcrypt.hash).toHaveBeenCalledWith('plain-password', 10);
+    });
+
+    it('should default to 10 rounds when JWT_SALT_OR_ROUNDS is empty', async () => {
+      setSaltRounds('');
+      const configuredService = await buildService();
+
+      await configuredService.create(makeCreateUserDto());
+
+      expect(bcrypt.hash).toHaveBeenCalledWith('plain-password', 10);
+    });
+
+    it('should read JWT_SALT_OR_ROUNDS once at construction', async () => {
+      setSaltRounds('12');
+      const configuredService = await buildService();
+      setSaltRounds('14');
+
+      await configuredService.create(makeCreateUserDto());
+
+      expect(bcrypt.hash).toHaveBeenCalledWith('plain-password', 12);
+      expect(mockUserRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ password: 'hashed(plain-password,12)' }),
+      );
+    });
+  });
+
   describe('findOne', () => {
     it('should return the user when found', async () => {
-      const user = { id: 1, email: 'test@example.com' };
+      const user = makeUser({ id: 1, email: 'test@example.com' });
       mockUserRepository.findOneBy.mockResolvedValue(user);
 
       await expect(service.findOne(1)).resolves.toEqual(user);
@@ -78,72 +166,73 @@ describe('UserService', () => {
 
   describe('create', () => {
     it('should return the saved user', async () => {
-      const saved = { id: 1, email: 'john@example.com' };
+      const saved = makeUser({ id: 7 });
       mockUserRepository.save.mockResolvedValue(saved);
 
       await expect(service.create(makeCreateUserDto())).resolves.toEqual(saved);
     });
 
     it('should hash the password before saving', async () => {
-      mockUserRepository.save.mockResolvedValue({ id: 1 });
-
       await service.create(makeCreateUserDto());
 
       expect(bcrypt.hash).toHaveBeenCalledWith('plain-password', 10);
       expect(mockUserRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({
           email: 'john@example.com',
-          password: 'hashed-pw',
+          password: 'hashed(plain-password,10)',
         }),
       );
       expect(mockUserRepository.create).not.toHaveBeenCalledWith(
         expect.objectContaining({ password: 'plain-password' }),
       );
-      expect(mockUserRepository.save).not.toHaveBeenCalledWith(
-        expect.objectContaining({ password: 'plain-password' }),
-      );
     });
 
-    it('should use JWT_SALT_OR_ROUNDS for the salt rounds', async () => {
-      mockConfigService.get.mockImplementation((key: string) =>
-        key === 'JWT_SALT_OR_ROUNDS' ? '12' : undefined,
-      );
-      // Rebuild so a service that reads config at construction sees '12'.
-      const configuredService = await buildService();
-      mockUserRepository.save.mockResolvedValue({ id: 1 });
+    it("should not mutate the caller's DTO", async () => {
+      const dto = Object.freeze(makeCreateUserDto());
 
-      await configuredService.create(makeCreateUserDto());
+      await service.create(dto);
 
-      expect(bcrypt.hash).toHaveBeenCalledWith('plain-password', 12);
+      expect(dto.password).toBe('plain-password');
     });
   });
 
   describe('update', () => {
-    const existingUser = { id: 1, email: 'john@example.com' };
-
     it('should hash the password when present', async () => {
-      mockUserRepository.findOneBy.mockResolvedValue(existingUser);
-      mockUserRepository.update.mockResolvedValue({ affected: 1 });
-
       await service.update(1, { password: 'new-password' });
 
       expect(bcrypt.hash).toHaveBeenCalledWith('new-password', 10);
-      expect(mockUserRepository.update).toHaveBeenCalledWith(
-        1,
-        expect.objectContaining({ password: 'hashed-pw' }),
-      );
+      expect(mockUserRepository.update).toHaveBeenCalledWith(1, {
+        password: 'hashed(new-password,10)',
+      });
+    });
+
+    it('should use JWT_SALT_OR_ROUNDS when hashing on update', async () => {
+      setSaltRounds('12');
+      const configuredService = await buildService();
+
+      await configuredService.update(1, { password: 'new-password' });
+
+      expect(bcrypt.hash).toHaveBeenCalledWith('new-password', 12);
+      expect(mockUserRepository.update).toHaveBeenCalledWith(1, {
+        password: 'hashed(new-password,12)',
+      });
     });
 
     it('should not hash when the password is absent', async () => {
-      mockUserRepository.findOneBy.mockResolvedValue(existingUser);
-      mockUserRepository.update.mockResolvedValue({ affected: 1 });
-
       await service.update(1, { firstname: 'Jane' });
 
       expect(bcrypt.hash).not.toHaveBeenCalled();
       expect(mockUserRepository.update).toHaveBeenCalledWith(1, {
         firstname: 'Jane',
       });
+    });
+
+    it("should not mutate the caller's DTO", async () => {
+      const dto: UpdateUserDto = Object.freeze({ password: 'new-password' });
+
+      await service.update(1, dto);
+
+      expect(dto.password).toBe('new-password');
     });
 
     it('should throw NotFoundException for an unknown id', async () => {
@@ -153,6 +242,7 @@ describe('UserService', () => {
         service.update(99, { password: 'new-password' }),
       ).rejects.toThrow(NotFoundException);
       expect(mockUserRepository.update).not.toHaveBeenCalled();
+      expect(bcrypt.hash).not.toHaveBeenCalled();
     });
   });
 });
