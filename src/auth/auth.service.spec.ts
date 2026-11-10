@@ -223,6 +223,16 @@ describe('AuthService', () => {
       },
     );
 
+    it('should return null for an email containing a NUL byte without looking anything up', async () => {
+      await expect(
+        service.validateUser('a\u0000@x.dev', 'plain-password'),
+      ).resolves.toBeNull();
+
+      expect(mockUserService.findOneByEmail).not.toHaveBeenCalled();
+      expect(bcrypt.compare).not.toHaveBeenCalled();
+      expect(mockUserService.hashPassword).not.toHaveBeenCalled();
+    });
+
     it.each(NON_STRINGS)(
       'should return null for a non-string password %p without looking anything up',
       async (pass) => {

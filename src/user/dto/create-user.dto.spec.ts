@@ -62,6 +62,23 @@ describe('CreateUserDto', () => {
       );
     });
 
+    it('should reject a firstname containing a NUL byte', async () => {
+      expect(await invalidProperties({ firstname: 'a\u0000b' })).toContain(
+        'firstname',
+      );
+    });
+
+    it('should explain that the firstname must not contain NUL characters', async () => {
+      const errors = await validateBody(
+        makeCreateUserBody({ firstname: 'a\u0000b' }),
+      );
+      const messages = errors
+        .filter((error) => error.property === 'firstname')
+        .flatMap((error) => Object.values(error.constraints ?? {}));
+
+      expect(messages).toContain('firstname must not contain NUL characters');
+    });
+
     it('should trim surrounding whitespace from the firstname', () => {
       const dto = plainToInstance(
         CreateUserDto,
@@ -97,6 +114,12 @@ describe('CreateUserDto', () => {
 
     it('should reject a whitespace-only lastname', async () => {
       expect(await invalidProperties({ lastname: '   ' })).toContain(
+        'lastname',
+      );
+    });
+
+    it('should reject a lastname containing a NUL byte', async () => {
+      expect(await invalidProperties({ lastname: 'a\u0000b' })).toContain(
         'lastname',
       );
     });

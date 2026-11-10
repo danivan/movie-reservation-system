@@ -11,7 +11,9 @@ describe('AppController', () => {
   };
 
   beforeEach(async () => {
-    jest.clearAllMocks();
+    // resetAllMocks so no implementation or *Once queue leaks between tests;
+    // each test stubs the service calls it relies on.
+    jest.resetAllMocks();
 
     const app: TestingModule = await Test.createTestingModule({
       controllers: [AppController],

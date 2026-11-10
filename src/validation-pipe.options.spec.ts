@@ -67,5 +67,18 @@ describe('validationPipeOptions', () => {
 
       expect(result).not.toHaveProperty('isAdmin');
     });
+
+    // Why IdParam exists: custom route args skip the `+value` coercion, so
+    // ParseIdPipe sees the raw string and can reject non-decimal ids.
+    const transformId = (type: 'custom' | 'param') =>
+      pipe.transform('0x10', { type, metatype: Number, data: 'id' });
+
+    it('should pass a custom route arg string through unchanged', async () => {
+      await expect(transformId('custom')).resolves.toBe('0x10');
+    });
+
+    it('should coerce a numeric @Param string with +value', async () => {
+      await expect(transformId('param')).resolves.toBe(16);
+    });
   });
 });

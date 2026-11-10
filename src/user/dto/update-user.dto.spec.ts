@@ -88,6 +88,12 @@ describe('UpdateUserDto', () => {
       expect(dto.email).toBe('foo@bar.dev');
     });
 
+    it('should reject a lastname containing a NUL byte', async () => {
+      expect(await invalidProperties({ lastname: 'a\u0000b' })).toContain(
+        'lastname',
+      );
+    });
+
     it('should reject a whitespace-only lastname', async () => {
       expect(await invalidProperties({ lastname: '   ' })).toContain(
         'lastname',

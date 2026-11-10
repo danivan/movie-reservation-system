@@ -18,6 +18,10 @@ const ID_RANGE_MESSAGE =
   'Validation failed (id must be between 1 and 2147483647)';
 // One past the Postgres `integer` max.
 const OUT_OF_RANGE_ID = '2147483648';
+// Accepted by `+value` (16 and 1000) but not decimal, so rejected by G17.
+const NON_DECIMAL_IDS = ['0x10', '1e3'];
+// Postgres text/varchar rejects U+0000 (SQLSTATE 22021).
+const NUL_NAME = 'a\u0000b';
 
 describe('Auth & User (e2e)', () => {
   let app: INestApplication;
@@ -149,6 +153,16 @@ describe('Auth & User (e2e)', () => {
 
       expect(res.body.message).toEqual(
         expect.arrayContaining([expect.stringContaining('password')]),
+      );
+    });
+
+    it('should reject a firstname containing a NUL byte with 400', async () => {
+      const res = await register(
+        makeRegisterBody({ firstname: NUL_NAME }),
+      ).expect(400);
+
+      expect(res.body.message).toEqual(
+        expect.arrayContaining([expect.stringContaining('firstname')]),
       );
     });
 
@@ -323,6 +337,32 @@ describe('Auth & User (e2e)', () => {
       expect(row?.firstname).toBe('Jane');
     });
 
+    it('should reject a lastname containing a NUL byte with 400', async () => {
+      const user = await seedUser();
+
+      const res = await patchUser(user.id, { lastname: NUL_NAME }).expect(400);
+
+      expect(res.body.message).toEqual(
+        expect.arrayContaining([expect.stringContaining('lastname')]),
+      );
+      const row = await dataSource
+        .getRepository(User)
+        .findOneByOrFail({ id: user.id });
+      expect(row.lastname).toBe('Seeded');
+    });
+
+    it.each(NON_DECIMAL_IDS)(
+      'should return 400 for the non-decimal id %p',
+      async (id) => {
+        const res = await authed(
+          request(server()).patch(`/user/${id}`).send({ firstname: 'Hex' }),
+          adminToken,
+        ).expect(400);
+
+        expect(res.body.message).toBe(NUMERIC_ID_MESSAGE);
+      },
+    );
+
     it('should return the updated user without password', async () => {
       const user = await seedUser();
 
@@ -402,6 +442,18 @@ describe('Auth & User (e2e)', () => {
       expect(res.body.message).toBe(ID_RANGE_MESSAGE);
     });
 
+    it.each(NON_DECIMAL_IDS)(
+      'should return 400 for the non-decimal id %p',
+      async (id) => {
+        const res = await authed(
+          request(server()).get(`/user/${id}`),
+          adminToken,
+        ).expect(400);
+
+        expect(res.body.message).toBe(NUMERIC_ID_MESSAGE);
+      },
+    );
+
     it('should return 400 for id 0', async () => {
       const res = await authed(
         request(server()).get('/user/0'),
@@ -441,6 +493,17 @@ describe('Auth & User (e2e)', () => {
 
       expect(res.body.message).toBe(ID_RANGE_MESSAGE);
     });
+
+    it.each(NON_DECIMAL_IDS)(
+      'should return 400 for the non-decimal id %p',
+      async (id) => {
+        const req = request(server()).delete(`/user/${id}`);
+
+        const res = await authed(req, adminToken).expect(400);
+
+        expect(res.body.message).toBe(NUMERIC_ID_MESSAGE);
+      },
+    );
 
     it('should delete a user', async () => {
       const user = await seedUser();
@@ -520,6 +583,17 @@ describe('Auth & User (e2e)', () => {
         .post('/auth/login')
         .send({ username: 123, password: 'whatever1' })
         .expect(401);
+    });
+
+    it('should return 401 for a username containing a NUL byte', async () => {
+      const username = `${RUN_PREFIX}nul\u0000@test.dev`;
+
+      const res = await request(server())
+        .post('/auth/login')
+        .send({ username, password: 'whatever1' })
+        .expect(401);
+
+      expect(res.body).toEqual({ statusCode: 401, message: 'Unauthorized' });
     });
 
     it('should return 401 for a non-string password', async () => {

@@ -1,8 +1,17 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
+import {
+  CUSTOM_ROUTE_ARGS_METADATA,
+  ROUTE_ARGS_METADATA,
+} from '@nestjs/common/constants';
 import { ParseIdPipe } from 'src/pipes/parse-id.pipe';
 import { UserController } from './user.controller';
 import { UserService } from './user.service';
+
+type RouteArg = {
+  data?: unknown;
+  pipes?: unknown[];
+  factory?: (data: unknown, ctx: unknown) => unknown;
+};
 
 describe('UserController', () => {
   let controller: UserController;
@@ -14,16 +23,22 @@ describe('UserController', () => {
     remove: jest.fn(),
   };
 
-  // The pipes bound to the `id` route param of a controller method.
-  const idParamPipes = (method: string): unknown[] => {
-    const args: Record<string, { data?: unknown; pipes?: unknown[] }> =
+  // The metadata key and entry of the `id` route arg of a controller method.
+  const idRouteArg = (method: string): [string, RouteArg] | undefined => {
+    const args: Record<string, RouteArg> =
       Reflect.getMetadata(ROUTE_ARGS_METADATA, UserController, method) ?? {};
-    const idArg = Object.values(args).find((arg) => arg.data === 'id');
-    return idArg?.pipes ?? [];
+    return Object.entries(args).find(([, arg]) => arg.data === 'id');
   };
 
+  // A minimal HTTP context whose request carries the given raw route params.
+  const httpContextWithParams = (params: Record<string, string>) => ({
+    switchToHttp: () => ({ getRequest: () => ({ params }) }),
+  });
+
   beforeEach(async () => {
-    jest.clearAllMocks();
+    // resetAllMocks so no implementation or *Once queue leaks between tests;
+    // each test stubs the service calls it relies on.
+    jest.resetAllMocks();
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [UserController],
@@ -38,14 +53,40 @@ describe('UserController', () => {
   });
 
   describe('id param', () => {
-    it.each(['findOne', 'update', 'remove'])(
+    const ID_METHODS = ['findOne', 'update', 'remove'];
+
+    // A custom decorator is skipped by the global ValidationPipe, so the raw
+    // string (not `+value`) reaches ParseIdPipe.
+    it.each(ID_METHODS)(
+      'should bind the id of %s as a custom route arg',
+      (method) => {
+        const key = idRouteArg(method)?.[0];
+
+        expect(key).toEqual(
+          expect.stringContaining(CUSTOM_ROUTE_ARGS_METADATA),
+        );
+      },
+    );
+
+    it.each(ID_METHODS)(
       'should parse the id of %s with ParseIdPipe',
       (method) => {
-        const pipes = idParamPipes(method);
+        const pipes = idRouteArg(method)?.[1].pipes ?? [];
 
         expect(
           pipes.some((p) => p === ParseIdPipe || p instanceof ParseIdPipe),
         ).toBe(true);
+      },
+    );
+
+    it.each(ID_METHODS)(
+      'should extract the raw id string of %s from the request params',
+      (method) => {
+        const arg = idRouteArg(method)?.[1];
+        const ctx = httpContextWithParams({ id: '0x10' });
+
+        expect(typeof arg?.factory).toBe('function');
+        expect(arg?.factory?.('id', ctx)).toBe('0x10');
       },
     );
   });

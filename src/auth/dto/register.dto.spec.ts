@@ -68,6 +68,12 @@ describe('RegisterDto', () => {
       );
     });
 
+    it('should reject a firstname containing a NUL byte', async () => {
+      expect(await invalidProperties({ firstname: 'a\u0000b' })).toContain(
+        'firstname',
+      );
+    });
+
     it('should trim and lowercase the email', () => {
       const dto = plainToInstance(
         RegisterDto,

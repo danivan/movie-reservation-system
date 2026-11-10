@@ -45,5 +45,17 @@ describe('ParseIdPipe', () => {
         });
       },
     );
+
+    it.each(['0x10', '1e3', '+5', ' 7 ', '0b11'])(
+      'should reject non-decimal formats such as %p with BadRequestException',
+      async (value) => {
+        const result = pipe.transform(value, metadata);
+
+        await expect(result).rejects.toBeInstanceOf(BadRequestException);
+        await expect(result).rejects.toMatchObject({
+          message: NUMERIC_MESSAGE,
+        });
+      },
+    );
   });
 });
