@@ -165,7 +165,74 @@ describe('Auth & User (e2e)', () => {
     });
   });
 
+  describe('POST /user', () => {
+    it('should store a bcrypt hash and let the created user log in', async () => {
+      const email = uniqueEmail();
+
+      await authed(
+        request(server()).post('/user').send({
+          firstname: 'Carl',
+          lastname: 'Created',
+          email,
+          password: PASSWORD,
+        }),
+        adminToken,
+      ).expect(201);
+
+      const res = await login(email, PASSWORD).expect(201);
+      expect(res.body.access_token).toEqual(expect.any(String));
+
+      const row = await dataSource
+        .getRepository(User)
+        .findOneByOrFail({ email });
+      expect(row.password).toMatch(/^\$2[aby]\$/);
+      expect(row.password).not.toBe(PASSWORD);
+    });
+  });
+
   describe('PATCH /user/:id', () => {
+    const NEW_PASSWORD = 'new-password-123';
+
+    const registerUser = async (email: string): Promise<User> => {
+      await register({
+        firstname: 'Pat',
+        lastname: 'Patched',
+        email,
+        password: PASSWORD,
+      }).expect(201);
+      return dataSource.getRepository(User).findOneByOrFail({ email });
+    };
+
+    const patchUser = (id: number, body: Record<string, unknown>) =>
+      authed(request(server()).patch(`/user/${id}`).send(body), adminToken);
+
+    it('should hash a new password so the user can log in with it', async () => {
+      const email = uniqueEmail();
+      const user = await registerUser(email);
+
+      await patchUser(user.id, { password: NEW_PASSWORD }).expect(200);
+
+      const res = await login(email, NEW_PASSWORD).expect(201);
+      expect(res.body.access_token).toEqual(expect.any(String));
+      await login(email, PASSWORD).expect(401);
+    });
+
+    it("should keep an admin's isAdmin when only the password is patched", async () => {
+      const email = uniqueEmail();
+      const user = await registerUser(email);
+      await dataSource
+        .getRepository(User)
+        .update({ id: user.id }, { isAdmin: true });
+
+      await patchUser(user.id, { password: NEW_PASSWORD }).expect(200);
+
+      const row = await dataSource
+        .getRepository(User)
+        .findOneByOrFail({ id: user.id });
+      expect(row.isAdmin).toBe(true);
+      await login(email, NEW_PASSWORD).expect(201);
+    });
+
     it('should reject a null firstname with 400', async () => {
       const email = uniqueEmail();
       await register({
