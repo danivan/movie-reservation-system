@@ -94,6 +94,12 @@ describe('UpdateUserDto', () => {
       );
     });
 
+    it('should reject a password made only of NUL bytes', async () => {
+      expect(
+        await invalidProperties({ password: '\u0000'.repeat(8) }),
+      ).toContain('password');
+    });
+
     it('should reject a whitespace-only lastname', async () => {
       expect(await invalidProperties({ lastname: '   ' })).toContain(
         'lastname',

@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
+import { randomBytes } from 'crypto';
 import { DataSource, ILike } from 'typeorm';
 import { AppModule } from './../src/app.module';
 import { User } from './../src/user/entities/user.entity';
@@ -10,6 +11,8 @@ import { spyOnAllLogging } from './utils/spy-on-logging';
 // afterAll can remove exactly the rows this run created.
 const RUN_PREFIX = `e2e-${Date.now()}-`;
 const PASSWORD = 'password123';
+// Fresh per run, so the seeded admin's credentials are never guessable.
+const ADMIN_PASSWORD = randomBytes(12).toString('hex');
 let emailSeq = 0;
 const uniqueEmail = () => `${RUN_PREFIX}${emailSeq++}@test.dev`;
 
@@ -29,6 +32,7 @@ describe('Auth & User (e2e)', () => {
   let adminToken: string;
 
   const server = () => app.getHttpServer();
+  const users = () => dataSource.getRepository(User);
 
   const register = (body: Record<string, unknown>) =>
     request(server()).post('/auth/register').send(body);
@@ -39,15 +43,33 @@ describe('Auth & User (e2e)', () => {
   const authed = (req: request.Test, token: string) =>
     req.set('Authorization', `Bearer ${token}`);
 
-  // Registers a fresh user and returns its DB row.
-  const seedUser = async (email = uniqueEmail()): Promise<User> => {
+  // Registers a fresh non-admin user and returns its DB row.
+  const seedUser = async ({
+    email = uniqueEmail(),
+    password = PASSWORD,
+  }: { email?: string; password?: string } = {}): Promise<User> => {
     await register({
       firstname: 'Sam',
       lastname: 'Seeded',
       email,
-      password: PASSWORD,
+      password,
     }).expect(201);
-    return dataSource.getRepository(User).findOneByOrFail({ email });
+    return users().findOneByOrFail({ email });
+  };
+
+  // Registers a fresh non-admin user, logs it in and returns its id and token.
+  const seedLoggedInUser = async (): Promise<{ id: number; token: string }> => {
+    const user = await seedUser();
+    const res = await login(user.email, PASSWORD).expect(201);
+    return { id: user.id, token: res.body.access_token };
+  };
+
+  // An id this run created and then deleted, so it is known not to exist
+  // without touching rows the suite didn't create.
+  const deletedUserId = async (): Promise<number> => {
+    const user = await seedUser();
+    await users().delete({ id: user.id });
+    return user.id;
   };
 
   beforeAll(async () => {
@@ -60,26 +82,16 @@ describe('Auth & User (e2e)', () => {
     dataSource = app.get(DataSource);
 
     // Register can't grant admin, so promote the seeded user directly in the DB.
-    const adminEmail = uniqueEmail();
-    await register({
-      firstname: 'Admin',
-      lastname: 'E2E',
-      email: adminEmail,
-      password: PASSWORD,
-    }).expect(201);
-    await dataSource
-      .getRepository(User)
-      .update({ email: adminEmail }, { isAdmin: true });
+    const admin = await seedUser({ password: ADMIN_PASSWORD });
+    await users().update({ id: admin.id }, { isAdmin: true });
 
-    const res = await login(adminEmail, PASSWORD).expect(201);
+    const res = await login(admin.email, ADMIN_PASSWORD).expect(201);
     adminToken = res.body.access_token;
   });
 
   afterAll(async () => {
     if (dataSource?.isInitialized) {
-      await dataSource
-        .getRepository(User)
-        .delete({ email: ILike(`${RUN_PREFIX}%`) });
+      await users().delete({ email: ILike(`${RUN_PREFIX}%`) });
     }
     await app?.close();
   });
@@ -116,12 +128,12 @@ describe('Auth & User (e2e)', () => {
       expect(res.body.message).toEqual(
         expect.arrayContaining([expect.stringContaining('isAdmin')]),
       );
-      const row = await dataSource.getRepository(User).findOneBy({ email });
+      const row = await users().findOneBy({ email });
       expect(row).toBeNull();
 
       // Positive control: the same lookup must see a row once one exists.
       await register(makeRegisterBody({ email })).expect(201);
-      const created = await dataSource.getRepository(User).findOneBy({ email });
+      const created = await users().findOneBy({ email });
       expect(created).not.toBeNull();
     });
 
@@ -156,6 +168,22 @@ describe('Auth & User (e2e)', () => {
       );
     });
 
+    // Native bcrypt hashes an all-NUL password like an empty one.
+    it('should reject a password made only of NUL bytes with 400', async () => {
+      const email = uniqueEmail();
+      const password = '\u0000'.repeat(8);
+
+      const res = await register(makeRegisterBody({ email, password })).expect(
+        400,
+      );
+
+      expect(res.body.message).toEqual(
+        expect.arrayContaining([expect.stringContaining('password')]),
+      );
+      const row = await users().findOneBy({ email });
+      expect(row).toBeNull();
+    });
+
     it('should reject a firstname containing a NUL byte with 400', async () => {
       const res = await register(
         makeRegisterBody({ firstname: NUL_NAME }),
@@ -172,7 +200,7 @@ describe('Auth & User (e2e)', () => {
       const res = await register(makeRegisterBody({ email })).expect(201);
 
       expect(res.body.isAdmin).toBe(false);
-      const row = await dataSource.getRepository(User).findOneBy({ email });
+      const row = await users().findOneBy({ email });
       expect(row?.isAdmin).toBe(false);
     });
 
@@ -184,9 +212,7 @@ describe('Auth & User (e2e)', () => {
       const res = await register(makeRegisterBody({ email })).expect(201);
 
       expect(res.body.email).toBe(lowercased);
-      const row = await dataSource
-        .getRepository(User)
-        .findOneBy({ email: lowercased });
+      const row = await users().findOneBy({ email: lowercased });
       expect(row).not.toBeNull();
     });
 
@@ -196,9 +222,8 @@ describe('Auth & User (e2e)', () => {
       expect(res.body).not.toHaveProperty('password');
     });
 
-    it('should return 409 for a duplicate email', async () => {
-      const email = uniqueEmail();
-      await register(makeRegisterBody({ email })).expect(201);
+    it('should return 409 for a duplicate email in a different case', async () => {
+      const { email } = await seedUser();
       const recased = email.replace('@test.dev', '@TEST.DEV');
 
       const res = await register(makeRegisterBody({ email: recased }));
@@ -207,6 +232,28 @@ describe('Auth & User (e2e)', () => {
       expect(res.body.message).toBe('Email already in use');
       expect(JSON.stringify(res.body)).not.toContain(email);
       expect(JSON.stringify(res.body)).not.toContain(recased);
+    });
+  });
+
+  describe('GET /user', () => {
+    it('should list users without any password', async () => {
+      const seeded = await seedUser();
+
+      const res = await authed(
+        request(server()).get('/user'),
+        adminToken,
+      ).expect(200);
+
+      // Non-vacuous: the list must contain a row this run created.
+      expect(res.body).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ email: seeded.email }),
+        ]),
+      );
+      // A boolean, so a failure never prints anyone's hash.
+      expect(
+        res.body.every((u: Record<string, unknown>) => !('password' in u)),
+      ).toBe(true);
     });
   });
 
@@ -228,9 +275,7 @@ describe('Auth & User (e2e)', () => {
       const res = await login(email, PASSWORD).expect(201);
       expect(res.body.access_token).toEqual(expect.any(String));
 
-      const row = await dataSource
-        .getRepository(User)
-        .findOneByOrFail({ email });
+      const row = await users().findOneByOrFail({ email });
       expect(row.password).toMatch(/^\$2[aby]\$/);
       expect(row.password).not.toBe(PASSWORD);
     });
@@ -261,80 +306,46 @@ describe('Auth & User (e2e)', () => {
   describe('PATCH /user/:id', () => {
     const NEW_PASSWORD = 'new-password-123';
 
-    const registerUser = async (email: string): Promise<User> => {
-      await register({
-        firstname: 'Pat',
-        lastname: 'Patched',
-        email,
-        password: PASSWORD,
-      }).expect(201);
-      return dataSource.getRepository(User).findOneByOrFail({ email });
-    };
-
     const patchUser = (id: number, body: Record<string, unknown>) =>
       authed(request(server()).patch(`/user/${id}`).send(body), adminToken);
 
     it('should hash a new password so the user can log in with it', async () => {
-      const email = uniqueEmail();
-      const before = await registerUser(email);
+      const before = await seedUser();
 
       await patchUser(before.id, { password: NEW_PASSWORD }).expect(200);
 
-      const after = await dataSource
-        .getRepository(User)
-        .findOneByOrFail({ id: before.id });
+      const after = await users().findOneByOrFail({ id: before.id });
       expect(after.password).toMatch(/^\$2[aby]\$/);
       expect(after.password).not.toBe(before.password);
-      const res = await login(email, NEW_PASSWORD).expect(201);
+      const res = await login(before.email, NEW_PASSWORD).expect(201);
       expect(res.body.access_token).toEqual(expect.any(String));
-      await login(email, PASSWORD).expect(401);
+      await login(before.email, PASSWORD).expect(401);
     });
 
     it("should keep an admin's isAdmin when only the password is patched", async () => {
-      const email = uniqueEmail();
-      const user = await registerUser(email);
-      await dataSource
-        .getRepository(User)
-        .update({ id: user.id }, { isAdmin: true });
+      const user = await seedUser();
+      await users().update({ id: user.id }, { isAdmin: true });
       // Precondition: the user really is an admin before the PATCH.
-      const promoted = await dataSource
-        .getRepository(User)
-        .findOneByOrFail({ id: user.id });
+      const promoted = await users().findOneByOrFail({ id: user.id });
       expect(promoted.isAdmin).toBe(true);
 
       await patchUser(user.id, { password: NEW_PASSWORD }).expect(200);
 
-      const row = await dataSource
-        .getRepository(User)
-        .findOneByOrFail({ id: user.id });
+      const row = await users().findOneByOrFail({ id: user.id });
       expect(row.isAdmin).toBe(true);
-      await login(email, NEW_PASSWORD).expect(201);
+      await login(user.email, NEW_PASSWORD).expect(201);
     });
 
     it('should reject a null firstname with 400', async () => {
-      const email = uniqueEmail();
-      await register({
-        firstname: 'Jane',
-        lastname: 'Doe',
-        email,
-        password: PASSWORD,
-      }).expect(201);
-      const user = await dataSource
-        .getRepository(User)
-        .findOneByOrFail({ email });
+      const user = await seedUser();
 
-      const res = await authed(
-        request(server()).patch(`/user/${user.id}`).send({ firstname: null }),
-        adminToken,
-      ).expect(400);
+      const res = await patchUser(user.id, { firstname: null }).expect(400);
 
       expect(res.body.message).toEqual(
         expect.arrayContaining([expect.stringContaining('firstname')]),
       );
-      const row = await dataSource
-        .getRepository(User)
-        .findOneBy({ id: user.id });
-      expect(row?.firstname).toBe('Jane');
+      const row = await users().findOneBy({ id: user.id });
+      expect(row?.firstname).toBe('Sam');
     });
 
     it('should reject a lastname containing a NUL byte with 400', async () => {
@@ -345,9 +356,7 @@ describe('Auth & User (e2e)', () => {
       expect(res.body.message).toEqual(
         expect.arrayContaining([expect.stringContaining('lastname')]),
       );
-      const row = await dataSource
-        .getRepository(User)
-        .findOneByOrFail({ id: user.id });
+      const row = await users().findOneByOrFail({ id: user.id });
       expect(row.lastname).toBe('Seeded');
     });
 
@@ -384,9 +393,7 @@ describe('Auth & User (e2e)', () => {
 
       expect(res.body.message).toBe('Email already in use');
       expect(JSON.stringify(res.body)).not.toContain(taken.email);
-      const row = await dataSource
-        .getRepository(User)
-        .findOneByOrFail({ id: user.id });
+      const row = await users().findOneByOrFail({ id: user.id });
       expect(row.email).toBe(user.email);
     });
 
@@ -399,7 +406,9 @@ describe('Auth & User (e2e)', () => {
     });
 
     it('should return 404 for an unknown id', async () => {
-      await patchUser(999999999, { firstname: 'Ghost' }).expect(404);
+      const id = await deletedUserId();
+
+      await patchUser(id, { firstname: 'Ghost' }).expect(404);
     });
 
     it('should return 400 for a non-numeric id', async () => {
@@ -463,6 +472,14 @@ describe('Auth & User (e2e)', () => {
       expect(res.body.message).toBe(ID_RANGE_MESSAGE);
     });
 
+    it('should return 404 for an unknown id', async () => {
+      const id = await deletedUserId();
+
+      await authed(request(server()).get(`/user/${id}`), adminToken).expect(
+        404,
+      );
+    });
+
     it('should return the user without password', async () => {
       const user = await seedUser();
 
@@ -505,6 +522,13 @@ describe('Auth & User (e2e)', () => {
       },
     );
 
+    it('should return 404 for an unknown id', async () => {
+      const id = await deletedUserId();
+      const req = request(server()).delete(`/user/${id}`);
+
+      await authed(req, adminToken).expect(404);
+    });
+
     it('should delete a user', async () => {
       const user = await seedUser();
 
@@ -513,29 +537,81 @@ describe('Auth & User (e2e)', () => {
         adminToken,
       ).expect(200);
 
-      const row = await dataSource
-        .getRepository(User)
-        .findOneBy({ id: user.id });
+      const row = await users().findOneBy({ id: user.id });
       expect(row).toBeNull();
     });
   });
 
-  describe('POST /auth/login', () => {
-    const registerUser = (email: string) =>
-      register({
-        firstname: 'Lou',
-        lastname: 'Login',
-        email,
-        password: PASSWORD,
-      }).expect(201);
+  describe('authorization', () => {
+    // A 403 (not 401) shows the token was accepted and the role check denied.
+    let userToken: string;
+    let userId: number;
 
+    beforeAll(async () => {
+      ({ id: userId, token: userToken } = await seedLoggedInUser());
+    });
+
+    it('should forbid a non-admin from creating a user with 403', async () => {
+      const email = uniqueEmail();
+
+      await authed(
+        request(server()).post('/user').send({
+          firstname: 'Nora',
+          lastname: 'Nonadmin',
+          email,
+          password: PASSWORD,
+        }),
+        userToken,
+      ).expect(403);
+
+      const row = await users().findOneBy({ email });
+      expect(row).toBeNull();
+    });
+
+    it('should forbid a non-admin from patching another user with 403', async () => {
+      const other = await seedUser();
+
+      await authed(
+        request(server())
+          .patch(`/user/${other.id}`)
+          .send({ firstname: 'Hijacked' }),
+        userToken,
+      ).expect(403);
+
+      const row = await users().findOneByOrFail({ id: other.id });
+      expect(row.firstname).toBe('Sam');
+    });
+
+    it('should forbid a non-admin from promoting themselves with 403', async () => {
+      await authed(
+        request(server()).patch(`/user/${userId}`).send({ isAdmin: true }),
+        userToken,
+      ).expect(403);
+
+      const row = await users().findOneByOrFail({ id: userId });
+      expect(row.isAdmin).toBe(false);
+    });
+
+    it('should forbid a non-admin from deleting another user with 403', async () => {
+      const other = await seedUser();
+
+      await authed(
+        request(server()).delete(`/user/${other.id}`),
+        userToken,
+      ).expect(403);
+
+      const row = await users().findOneBy({ id: other.id });
+      expect(row).not.toBeNull();
+    });
+  });
+
+  describe('POST /auth/login', () => {
     it('should reject an empty body with 401', async () => {
       await request(server()).post('/auth/login').send({}).expect(401);
     });
 
     it('should log in with correct credentials', async () => {
-      const email = uniqueEmail();
-      await registerUser(email);
+      const { email } = await seedUser();
 
       const res = await login(email, PASSWORD).expect(201);
 
@@ -550,8 +626,7 @@ describe('Auth & User (e2e)', () => {
     });
 
     it('should return the same response for an unknown email as for a wrong password', async () => {
-      const email = uniqueEmail();
-      await registerUser(email);
+      const { email } = await seedUser();
 
       const wrongPassword = await login(email, 'wrong-password-1');
       const unknownEmail = await login(uniqueEmail(), 'wrong-password-1');
@@ -566,8 +641,7 @@ describe('Auth & User (e2e)', () => {
     });
 
     it('should log in with a differently cased and padded email', async () => {
-      const email = uniqueEmail();
-      await registerUser(email);
+      const { email } = await seedUser();
       const recased = email
         .replace('e2e', 'E2E')
         .replace('@test.dev', '@TeSt.DeV');
@@ -597,8 +671,7 @@ describe('Auth & User (e2e)', () => {
     });
 
     it('should return 401 for a non-string password', async () => {
-      const email = uniqueEmail();
-      await registerUser(email);
+      const { email } = await seedUser();
 
       await request(server())
         .post('/auth/login')

@@ -77,7 +77,9 @@ describe('validationPipeOptions', () => {
       await expect(transformId('custom')).resolves.toBe('0x10');
     });
 
-    it('should coerce a numeric @Param string with +value', async () => {
+    // Characterization test: pins Nest's behaviour, not ours. If Nest stops
+    // coercing @Param values, IdParam is no longer needed but still harmless.
+    it("should coerce a numeric @Param string with +value (characterises Nest's coercion that IdParam avoids)", async () => {
       await expect(transformId('param')).resolves.toBe(16);
     });
   });

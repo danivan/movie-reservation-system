@@ -161,6 +161,13 @@ describe('CreateUserDto', () => {
       expect(await invalidProperties({ email: 123 })).toContain('email');
     });
 
+    // Postgres rejects U+0000 in text (G21); @IsEmail already rules it out.
+    it('should reject an email containing a NUL byte', async () => {
+      expect(await invalidProperties({ email: 'a\u0000@x.dev' })).toContain(
+        'email',
+      );
+    });
+
     it('should trim and lowercase the email', () => {
       const dto = plainToInstance(
         CreateUserDto,
@@ -218,6 +225,31 @@ describe('CreateUserDto', () => {
       expect(await invalidProperties({ password: 12345678 })).toContain(
         'password',
       );
+    });
+
+    // Native bcrypt stops at the first NUL, so an all-NUL password hashes
+    // like an empty one.
+    it('should reject a password made only of NUL bytes', async () => {
+      expect(
+        await invalidProperties({ password: '\u0000'.repeat(8) }),
+      ).toContain('password');
+    });
+
+    it('should reject a password containing a NUL byte', async () => {
+      expect(await invalidProperties({ password: 'abc\u0000defgh' })).toContain(
+        'password',
+      );
+    });
+
+    it('should explain that the password must not contain NUL characters', async () => {
+      const errors = await validateBody(
+        makeCreateUserBody({ password: 'abc\u0000defgh' }),
+      );
+      const messages = errors
+        .filter((error) => error.property === 'password')
+        .flatMap((error) => Object.values(error.constraints ?? {}));
+
+      expect(messages).toContain('password must not contain NUL characters');
     });
   });
 

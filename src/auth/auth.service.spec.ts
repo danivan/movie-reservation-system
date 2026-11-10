@@ -129,6 +129,43 @@ describe('AuthService', () => {
       );
     });
 
+    // G7: a fire-and-forget compare would let unknown emails answer early.
+    it('should not settle for an unknown email until the dummy compare resolves', async () => {
+      let resolveCompare: (matches: boolean) => void = () => undefined;
+      (bcrypt.compare as jest.Mock).mockImplementationOnce(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveCompare = resolve;
+          }),
+      );
+      let settled = false;
+
+      const result = service.validateUser(
+        'missing@example.com',
+        'plain-password',
+      );
+      result.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await flushPromises();
+
+      // The deferred compare is the one in flight, so only it can hold the
+      // result back.
+      expect(bcrypt.compare).toHaveBeenCalledWith(
+        'plain-password',
+        `hashed:${dummyPlain()}`,
+      );
+      expect(settled).toBe(false);
+
+      resolveCompare(false);
+      await expect(result).resolves.toBeNull();
+    });
+
     it('should return null for an unknown email even if compare resolves true', async () => {
       mockUserService.findOneByEmail.mockResolvedValueOnce(null);
       (bcrypt.compare as jest.Mock).mockResolvedValueOnce(true);
@@ -287,6 +324,36 @@ describe('AuthService', () => {
         'plain-password',
         `hashed:${dummyPlain(1)}`,
       );
+    });
+  });
+
+  describe('login', () => {
+    it('should sign exactly email, sub and isAdmin false for a non-admin', async () => {
+      await service.login(makeUser({ id: 7, email: 'jane@example.com' }));
+
+      expect(mockJwtService.sign).toHaveBeenCalledWith({
+        email: 'jane@example.com',
+        sub: 7,
+        isAdmin: false,
+      });
+    });
+
+    it('should sign isAdmin true for an admin', async () => {
+      await service.login(
+        makeUser({ id: 8, email: 'admin@example.com', isAdmin: true }),
+      );
+
+      expect(mockJwtService.sign).toHaveBeenCalledWith({
+        email: 'admin@example.com',
+        sub: 8,
+        isAdmin: true,
+      });
+    });
+
+    it('should return the signed token as access_token', async () => {
+      await expect(service.login(makeUser())).resolves.toEqual({
+        access_token: 'signed-token',
+      });
     });
   });
 

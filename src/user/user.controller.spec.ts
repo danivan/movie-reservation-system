@@ -4,6 +4,8 @@ import {
   ROUTE_ARGS_METADATA,
 } from '@nestjs/common/constants';
 import { ParseIdPipe } from 'src/pipes/parse-id.pipe';
+import { ROLES_KEY } from 'src/decorators/role.decorator';
+import { Role } from 'src/types';
 import { UserController } from './user.controller';
 import { UserService } from './user.service';
 
@@ -87,6 +89,22 @@ describe('UserController', () => {
 
         expect(typeof arg?.factory).toBe('function');
         expect(arg?.factory?.('id', ctx)).toBe('0x10');
+      },
+    );
+  });
+
+  describe('roles', () => {
+    // RolesGuard reads this metadata; the e2e authorization tests cover the
+    // guard itself.
+    it.each(['create', 'update', 'remove'] as const)(
+      'should restrict %s to admins',
+      (method) => {
+        const roles = Reflect.getMetadata(
+          ROLES_KEY,
+          UserController.prototype[method],
+        );
+
+        expect(roles).toEqual([Role.ADMIN]);
       },
     );
   });

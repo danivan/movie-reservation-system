@@ -74,6 +74,12 @@ describe('RegisterDto', () => {
       );
     });
 
+    it('should reject a password made only of NUL bytes', async () => {
+      expect(
+        await invalidProperties({ password: '\u0000'.repeat(8) }),
+      ).toContain('password');
+    });
+
     it('should trim and lowercase the email', () => {
       const dto = plainToInstance(
         RegisterDto,

@@ -139,14 +139,26 @@ describe('UserService', () => {
   });
 
   describe('constructor', () => {
-    it.each(['9', '16', '1', '0', '-1', '4.5', 'abc', '1e9', 'Infinity'])(
-      'should fail to build when JWT_SALT_OR_ROUNDS is %p',
-      async (value) => {
-        setSaltRounds(value);
+    it.each([
+      '9',
+      '16',
+      '1',
+      '0',
+      '-1',
+      '4.5',
+      'abc',
+      '1e9',
+      'Infinity',
+      // Number() reads each of these as 10 or 12; only decimal digits pass.
+      '1e1',
+      ' 12',
+      '12.0',
+      '0x0c',
+    ])('should fail to build when JWT_SALT_OR_ROUNDS is %p', async (value) => {
+      setSaltRounds(value);
 
-        await expect(buildService()).rejects.toThrow(/JWT_SALT_OR_ROUNDS/);
-      },
-    );
+      await expect(buildService()).rejects.toThrow(/JWT_SALT_OR_ROUNDS/);
+    });
 
     it.each([
       ['10', 10],
@@ -271,9 +283,6 @@ describe('UserService', () => {
       await expect(result).rejects.toMatchObject({
         message: 'Email already in use',
       });
-      await expect(result).rejects.toMatchObject({
-        message: expect.not.stringContaining(SECRET_EMAIL),
-      });
     });
 
     it('should throw a generic InternalServerErrorException for other DB errors', async () => {
@@ -285,10 +294,50 @@ describe('UserService', () => {
       await expect(result).rejects.toMatchObject({
         message: 'Failed to create user',
       });
-      await expect(result).rejects.toMatchObject({
-        message: expect.not.stringContaining('connection refused'),
-      });
     });
+
+    // Rejections that are not Error instances, including a raw driver-style
+    // object carrying the query and its parameters.
+    const NON_ERRORS: unknown[] = [
+      undefined,
+      'str',
+      { query: 'INSERT INTO "user" ...', parameters: [SECRET_EMAIL] },
+    ];
+
+    it.each(NON_ERRORS)(
+      'should map a non-Error rejection %p to a generic InternalServerErrorException',
+      async (thrown) => {
+        mockUserRepository.save.mockRejectedValue(thrown);
+
+        const result = service.create(makeCreateUserDto());
+
+        await expect(result).rejects.toBeInstanceOf(
+          InternalServerErrorException,
+        );
+        await expect(result).rejects.toMatchObject({
+          message: 'Failed to create user',
+        });
+      },
+    );
+
+    it.each(NON_ERRORS)(
+      'should log a non-Error rejection %p as "Non-Error thrown" without its contents',
+      async (thrown) => {
+        mockUserRepository.save.mockRejectedValue(thrown);
+
+        await expect(
+          service.create(makeCreateUserDto({ email: SECRET_EMAIL })),
+        ).rejects.toBeInstanceOf(InternalServerErrorException);
+
+        const logged = loggerErrorSpy.mock.calls
+          .flat()
+          .map(stringifyLogArg)
+          .join('\n');
+        expect(logged).toContain('Non-Error thrown');
+        expect(logged).not.toContain(SECRET_EMAIL);
+        expect(logged).not.toContain('INSERT');
+      },
+    );
 
     it('should throw a generic InternalServerErrorException when hashing fails', async () => {
       (bcrypt.hash as jest.Mock).mockRejectedValue(new Error(DB_TEXT));
@@ -458,9 +507,6 @@ describe('UserService', () => {
       await expect(result).rejects.toMatchObject({
         message: 'Failed to update user',
       });
-      await expect(result).rejects.toMatchObject({
-        message: expect.not.stringContaining('connection refused'),
-      });
     });
 
     it('should throw a generic InternalServerErrorException for a non-unique QueryFailedError', async () => {
@@ -531,9 +577,6 @@ describe('UserService', () => {
       await expect(result).rejects.toBeInstanceOf(InternalServerErrorException);
       await expect(result).rejects.toMatchObject({
         message: 'Failed to remove user',
-      });
-      await expect(result).rejects.toMatchObject({
-        message: expect.not.stringContaining('connection refused'),
       });
     });
   });

@@ -49,7 +49,6 @@ describe('AppController', () => {
 
       const result = await appController.register(dto);
 
-      expect(mockAuthService.signUp).toHaveBeenCalledWith(dto);
       expect(mockAuthService.signUp.mock.calls[0][0]).toBe(dto);
       expect(result).toEqual(created);
     });
