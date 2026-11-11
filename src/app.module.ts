@@ -5,6 +5,8 @@ import { UserModule } from './user/user.module';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { User } from './user/entities/user.entity';
+import { Movie } from './movie/entities/movie.entity';
+import { MovieModule } from './movie/movie.module';
 import { AuthModule } from './auth/auth.module';
 import { APP_GUARD, APP_PIPE } from '@nestjs/core';
 import { RolesGuard } from './auth/role.guard';
@@ -22,12 +24,13 @@ import { validationPipeOptions } from './validation-pipe.options';
         username: configService.get<string>('DB_USERNAME'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_NAME'),
-        entities: [User],
+        entities: [User, Movie],
         synchronize: true,
       }),
       inject: [ConfigService],
     }),
     UserModule,
+    MovieModule,
     ConfigModule.forRoot({
       isGlobal: true,
       cache: true,
