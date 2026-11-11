@@ -5,8 +5,11 @@ import { UserModule } from './user/user.module';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { User } from './user/entities/user.entity';
+import { Movie } from './movie/entities/movie.entity';
+import { MovieModule } from './movie/movie.module';
 import { AuthModule } from './auth/auth.module';
 import { APP_GUARD, APP_PIPE } from '@nestjs/core';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { RolesGuard } from './auth/role.guard';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { validationPipeOptions } from './validation-pipe.options';
@@ -22,17 +25,21 @@ import { validationPipeOptions } from './validation-pipe.options';
         username: configService.get<string>('DB_USERNAME'),
         password: configService.get<string>('DB_PASSWORD'),
         database: configService.get<string>('DB_NAME'),
-        entities: [User],
+        entities: [User, Movie],
         synchronize: true,
       }),
       inject: [ConfigService],
     }),
     UserModule,
+    MovieModule,
     ConfigModule.forRoot({
       isGlobal: true,
       cache: true,
     }),
     AuthModule,
+    // Defaults for routes that opt in with @UseGuards(ThrottlerGuard); the
+    // guard is not registered globally. Routes override with @Throttle.
+    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
   ],
   controllers: [AppController],
   providers: [

@@ -6,7 +6,7 @@ import {
   PipeTransform,
 } from '@nestjs/common';
 
-// Postgres `integer` max, the column type of `user.id`.
+// Postgres `integer` max, the column type of every serial `id`.
 const MAX_PG_INTEGER = 2147483647;
 
 @Injectable()

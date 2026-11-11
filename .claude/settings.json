@@ -1,0 +1,59 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npm test --silent >/dev/null 2>&1 || { echo 'TESTS RED' >&2; exit 2; }"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Read", "Edit",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(npm test *)",
+      "Bash(npm run lint)",
+      "Bash(npm run migrate)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(git add -A:*)",
+      "Bash(git add --all:*)",
+      "Bash(git add .:*)",
+      "Bash(git commit:*)",
+      "Bash(npm install:*)",
+      "Bash(docker:*)"
+    ],
+    "deny": [
+      "Read(./.env*)",
+      "Read(./secrets/**)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(rm -rf:*)",
+      "WebFetch",
+      "Bash(git commit *--no-gpg-sign*)",
+      "Bash(git commit *--author=*)",
+      "Bash(git -c user.*)",
+      "Bash(git config *)"
+    ],
+    "defaultMode": "plan",
+    "disableBypassPermissionsMode": "disable"
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false
+  }
+}
