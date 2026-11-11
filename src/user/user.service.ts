@@ -80,6 +80,14 @@ export class UserService {
       throw new BadRequestException('No fields to update');
     }
 
+    const { password } = updateUserDto;
+    if (
+      password !== undefined &&
+      (typeof password !== 'string' || password === '')
+    ) {
+      throw new BadRequestException('password must not be empty');
+    }
+
     await this.findOne(id);
 
     try {

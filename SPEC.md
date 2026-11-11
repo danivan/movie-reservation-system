@@ -96,6 +96,7 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 - `src/user/user.service.spec.ts`: provide a `ConfigService` mock and mock `bcrypt`. Tests:
   - `create` saves the hashed password, never the plaintext.
   - `update` hashes `password` when present and doesn't call `bcrypt.hash` when absent.
+  - A present-but-empty password (`''` or `null`, from a non-HTTP caller) is rejected with `BadRequestException('password must not be empty')` before any DB call or hashing. Added after the final review.
 - `src/auth/auth.service.spec.ts`: `signUp` passes the plaintext password to `create` and doesn't call `bcrypt.hash` itself.
 - E2E:
   - As admin, `POST /user` → the new user can log in. A DB read of that row shows `password` starting with `$2b$`.
@@ -104,7 +105,9 @@ For each cycle: **Red** — write the tests and run them to confirm they fail fo
 **Green**
 - `src/user/user.service.ts`: inject `ConfigService` and add `hashPassword()`; use it in `create` and `update`.
   - Validate `JWT_SALT_OR_ROUNDS` once in the constructor (G16).
-  - In `update`, hash when `password != null`. The DTO already rejects `null` over HTTP; this guards non-HTTP callers.
+  - In `update`, a `password` key that is present but not a non-empty string (`''` or `null`) gets 400 `password must not be empty`. That check runs after the "No fields to update" guard and before `findOne`; otherwise the password is hashed.
+    - The DTO already rejects both over HTTP (`@MinLength(8)`, `skipNullProperties: false`); this guards non-HTTP callers.
+    - Neither alternative works. Silently dropping the field turned `{password: ''}` into an empty update, so a 500 (G4), and ignored a requested password change. Hashing `''` stored a valid hash of an empty password.
 - `src/auth/auth.service.ts`: remove `saltOrRounds` and the hashing. The `ConfigService` constructor parameter stays for now (see the Cycle 3 note).
 
 **Review-driven test hardening:**
