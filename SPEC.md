@@ -15,6 +15,7 @@
 ### Data: `Movie` entity (`src/movie/entities/movie.entity.ts`)
 - `id`: serial PK.
 - `title`: `varchar(200)`, required, **not unique** (remakes share titles).
+- Non-unique index on `(title, releaseDate)` for the duplicate check (see Service).
 - `description`: `text`, required.
 - `durationMinutes`: `int`, required.
 - `genre`: Postgres enum of the new `Genre` enum, required.
@@ -27,8 +28,9 @@
   - Optional `?genre=<Genre>` filter.
   - Ordered by `title ASC, id ASC`.
   - Returns `[]` when nothing matches (not a 404).
+  - Rate-limited to 100 requests per 60 s per client IP (`@UseGuards(ThrottlerGuard)` + `@Throttle`); the 101st gives 429 with `Retry-After`. `ThrottlerModule.forRoot` in `app.module.ts`; the guard is not global, so no other route is limited. Counts are in-memory per app instance.
 - `GET /movie/:id`: `@Public()`. Returns 404 `Movie with ID ${id} not found` when it doesn't exist.
-- `POST /movie`: `@Roles(Role.ADMIN)`. Returns 201 with the created movie.
+- `POST /movie`: `@Roles(Role.ADMIN)`. Returns 201 with the created movie, or 409 when a movie with the same title, description and release date exists (an accidental double submit).
 - `PATCH /movie/:id`: `@Roles(Role.ADMIN)`. Returns 200 with the movie **reloaded** from the DB.
 - `DELETE /movie/:id`: `@Roles(Role.ADMIN)`. Returns 200 with an empty body, the same as `DELETE /user/:id`.
 - Every `:id` uses `@IdParam()` (G17), so `abc`, `0`, `0x10`, `1e3` and `2147483648` all give 400.
@@ -59,10 +61,16 @@
   - Throws 400 `No fields to update` when every value is `undefined`, before any DB call.
   - `{ posterUrl: null }` is **not** empty.
   - Then it checks the movie exists (404), updates, and returns `findOne(id)`.
+- `create`: in one transaction:
+  - Takes `pg_advisory_xact_lock(hashtext($1))` keyed on title + release date (bound parameter), so concurrent identical requests serialize.
+  - `existsBy({ title, description, releaseDate })` (after trimming, exact match); if found, 409 `A movie with this title, description and release date already exists`, with no request data in the body and nothing logged.
+  - Otherwise `create` + `save` through the transaction's repository.
+  - No unique index: a btree can't hold a 5000-character `description`.
+  - `PATCH` does not run this check (follow-up).
 - `remove`: checks the movie exists (404), then deletes it.
 - Write errors (`create`, `update`, `remove`):
   - An `HttpException` passes through unchanged.
-  - Anything else becomes 500 `Failed to <action> movie`. That includes `23505`; there's no 409, because `movie` has no unique column.
+  - Anything else becomes 500 `Failed to <action> movie`. That includes `23505`, because `movie` has no unique column; the only 409 is the duplicate check's `ConflictException`.
 - Logging on a failed write: Nest `Logger` with the error's name, message and stack only (cf. `user.service.ts:119-144`). No TypeORM `query` or `parameters`.
 - Don't copy the dead `if (!users)` check from `user.service.ts:60-62`.
 
@@ -112,11 +120,13 @@
   - `update` returns the second `findOneBy` result.
   - `23505` and other DB errors become 500 without DB text in the message, and the log has no `query`/`parameters`.
   - `HttpException` passthrough.
+  - `create`: lock → duplicate check → save, in that order, all inside the transaction; the duplicate check uses exactly title, description and release date; a duplicate gives 409 without saving or logging; failures of the lock, check or save map to 500.
 - **`movie.controller.spec.ts`:**
   - `findOne`/`update`/`remove` use `@IdParam` with `ParseIdPipe`. Same approach as `user.controller.spec.ts:57-95`.
   - `ROLES_KEY = [Role.ADMIN]` on `create`/`update`/`remove` only.
   - `IS_PUBLIC_KEY` on `findAll`/`findOne` only.
   - Each method passes its exact arguments to the service.
+  - `findAll` alone has `ThrottlerGuard` with limit 100 and ttl 60000.
 
 ### E2E (`npm run test:e2e`, `test/movie.e2e-spec.ts`)
 - **Harness:** same as `test/auth-user.e2e-spec.ts:75-97`.
@@ -139,11 +149,14 @@
 - **Auth:** `POST`, `PATCH` and `DELETE` give 401 without a token and 403 for a non-admin, and the DB row is unchanged.
 - **Writes:**
   - `POST` gives 201 with trimmed strings.
-  - Posting the same body twice gives two different ids.
+  - Posting the same body twice gives 409 and one row, also when the second body differs only in padding or in duration, genre or poster.
+  - Two concurrent identical `POST`s give one 201 and one 409, and one row.
+  - The same title with a different release date or description gives 201; re-creating a deleted movie gives 201.
   - `PATCH { durationMinutes: 150 }` changes only that field.
   - `PATCH { posterUrl: null }` clears it in the DB.
   - After `DELETE`, a `GET` gives 404.
-- **Logging:** `spyOnAllLogging()` records nothing across a successful `POST` → `PATCH` → `DELETE`.
+- **Logging:** `spyOnAllLogging()` records nothing across a successful `POST` → `PATCH` → `DELETE`, or on a rejected duplicate `POST`.
+- **Rate limit** (last, it uses up the quota): `GET /movie` sends `X-RateLimit-Limit: 100`, gives 429 with `Retry-After` once the quota is used, and `GET /movie/:id` is not limited.
 
 ### Manual (`npm run start:dev`)
 - **Setup:**

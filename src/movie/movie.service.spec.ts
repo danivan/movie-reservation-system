@@ -24,6 +24,19 @@ describe('MovieService', () => {
     findOneBy: jest.fn(),
     update: jest.fn(),
     delete: jest.fn(),
+    manager: { transaction: jest.fn() },
+  };
+  // create() works inside a transaction, through the transaction's own
+  // repository. A separate mock, so a create/save on the injected repository
+  // (outside the transaction and its lock) fails the tests.
+  const mockTxRepository = {
+    create: jest.fn(),
+    save: jest.fn(),
+    existsBy: jest.fn(),
+  };
+  const mockTxManager = {
+    getRepository: jest.fn(),
+    query: jest.fn(),
   };
 
   // Added by the repo.create stub, so save() must receive the created entity
@@ -200,11 +213,20 @@ describe('MovieService', () => {
     // resetAllMocks (not clearAllMocks) so no implementation or *Once queue
     // leaks from one test into the next; every default is re-stubbed below.
     jest.resetAllMocks();
-    mockMovieRepository.create.mockImplementation((data) => ({
+    mockMovieRepository.manager.transaction.mockImplementation(
+      async (work: (manager: typeof mockTxManager) => Promise<unknown>) =>
+        work(mockTxManager),
+    );
+    mockTxManager.getRepository.mockImplementation((entity) =>
+      entity === Movie ? mockTxRepository : undefined,
+    );
+    mockTxManager.query.mockResolvedValue([]);
+    mockTxRepository.existsBy.mockResolvedValue(false);
+    mockTxRepository.create.mockImplementation((data) => ({
       ...data,
       marker: CREATED_MARKER,
     }));
-    mockMovieRepository.save.mockImplementation(async (entity) => ({
+    mockTxRepository.save.mockImplementation(async (entity) => ({
       id: 1,
       ...entity,
     }));
@@ -234,22 +256,27 @@ describe('MovieService', () => {
   });
 
   describe('create', () => {
-    it('should pass the dto to repo.create', async () => {
+    const DUPLICATE_MESSAGE =
+      'A movie with this title, description and release date already exists';
+
+    it('should pass the dto to repo.create inside the transaction', async () => {
       await service.create(makeCreateMovieDto());
 
-      expect(mockMovieRepository.create).toHaveBeenCalledWith({
+      expect(mockMovieRepository.manager.transaction).toHaveBeenCalledTimes(1);
+      expect(mockTxRepository.create).toHaveBeenCalledWith({
         title: 'Arrival',
         description: 'A linguist works with the military to talk to aliens.',
         durationMinutes: 116,
         genre: Genre.SCI_FI,
         releaseDate: '2016-11-11',
       });
+      expect(mockMovieRepository.create).not.toHaveBeenCalled();
     });
 
     it('should save the entity returned by repo.create', async () => {
       await service.create(makeCreateMovieDto());
 
-      expect(mockMovieRepository.save).toHaveBeenCalledWith({
+      expect(mockTxRepository.save).toHaveBeenCalledWith({
         title: 'Arrival',
         description: 'A linguist works with the military to talk to aliens.',
         durationMinutes: 116,
@@ -257,6 +284,7 @@ describe('MovieService', () => {
         releaseDate: '2016-11-11',
         marker: CREATED_MARKER,
       });
+      expect(mockMovieRepository.save).not.toHaveBeenCalled();
     });
 
     it('should return the saved movie', async () => {
@@ -273,23 +301,128 @@ describe('MovieService', () => {
       });
     });
 
+    it('should take a transaction-scoped advisory lock keyed on title and release date, as a bound parameter', async () => {
+      await service.create(
+        makeCreateMovieDto({ title: "Dune'; --", releaseDate: '2021-10-22' }),
+      );
+
+      expect(mockTxManager.query).toHaveBeenCalledTimes(1);
+      expect(mockTxManager.query).toHaveBeenCalledWith(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        [`movie:${JSON.stringify(["Dune'; --", '2021-10-22'])}`],
+      );
+    });
+
+    it('should lock, then check for a duplicate, then save', async () => {
+      await service.create(makeCreateMovieDto());
+
+      const [lock] = mockTxManager.query.mock.invocationCallOrder;
+      const [check] = mockTxRepository.existsBy.mock.invocationCallOrder;
+      const [save] = mockTxRepository.save.mock.invocationCallOrder;
+      expect(lock).toBeLessThan(check);
+      expect(check).toBeLessThan(save);
+    });
+
+    it('should look for a duplicate by exactly title, description and release date', async () => {
+      await service.create(
+        makeCreateMovieDto({
+          title: 'Dune',
+          description: 'Spice.',
+          releaseDate: '2021-10-22',
+          durationMinutes: 155,
+          genre: Genre.ACTION,
+          posterUrl: 'https://example.com/dune.jpg',
+        }),
+      );
+
+      expect(mockTxRepository.existsBy).toHaveBeenCalledTimes(1);
+      expect(mockTxRepository.existsBy).toHaveBeenCalledWith({
+        title: 'Dune',
+        description: 'Spice.',
+        releaseDate: '2021-10-22',
+      });
+    });
+
+    it('should throw ConflictException without saving when a duplicate exists', async () => {
+      mockTxRepository.existsBy.mockResolvedValue(true);
+
+      const result = service.create(makeCreateMovieDto());
+
+      await expect(result).rejects.toBeInstanceOf(ConflictException);
+      await expect(result).rejects.toMatchObject({
+        message: DUPLICATE_MESSAGE,
+      });
+      expect(mockTxRepository.create).not.toHaveBeenCalled();
+      expect(mockTxRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('should not echo the request or log anything on a duplicate', async () => {
+      mockTxRepository.existsBy.mockResolvedValue(true);
+
+      const err: unknown = await service
+        .create(
+          makeCreateMovieDto({
+            title: SECRET_TITLE,
+            description: SECRET_DESCRIPTION,
+          }),
+        )
+        .catch((e: unknown) => e);
+
+      expect((err as ConflictException).getResponse()).toEqual({
+        statusCode: 409,
+        message: DUPLICATE_MESSAGE,
+        error: 'Conflict',
+      });
+      logging.expectNoLogging();
+    });
+
     it('should log nothing on a successful create', async () => {
       await service.create(makeCreateMovieDto());
 
       logging.expectNoLogging();
     });
 
-    itMapsWriteErrors(
-      'create',
-      (err) => mockMovieRepository.save.mockRejectedValue(err),
-      () =>
-        service.create(
-          makeCreateMovieDto({
-            title: SECRET_TITLE,
-            description: SECRET_DESCRIPTION,
-          }),
-        ),
-    );
+    describe('when save fails', () => {
+      itMapsWriteErrors(
+        'create',
+        (err) => mockTxRepository.save.mockRejectedValue(err),
+        () =>
+          service.create(
+            makeCreateMovieDto({
+              title: SECRET_TITLE,
+              description: SECRET_DESCRIPTION,
+            }),
+          ),
+      );
+    });
+
+    describe('when the lock query fails', () => {
+      itMapsWriteErrors(
+        'create',
+        (err) => mockTxManager.query.mockRejectedValue(err),
+        () =>
+          service.create(
+            makeCreateMovieDto({
+              title: SECRET_TITLE,
+              description: SECRET_DESCRIPTION,
+            }),
+          ),
+      );
+    });
+
+    describe('when the duplicate check fails', () => {
+      itMapsWriteErrors(
+        'create',
+        (err) => mockTxRepository.existsBy.mockRejectedValue(err),
+        () =>
+          service.create(
+            makeCreateMovieDto({
+              title: SECRET_TITLE,
+              description: SECRET_DESCRIPTION,
+            }),
+          ),
+      );
+    });
   });
 
   describe('findAll', () => {
@@ -392,7 +525,8 @@ describe('MovieService', () => {
         await expect(result).rejects.toMatchObject({
           message: 'No fields to update',
         });
-        for (const fn of Object.values(mockMovieRepository)) {
+        const { manager, ...repoFns } = mockMovieRepository;
+        for (const fn of [...Object.values(repoFns), manager.transaction]) {
           expect(fn).not.toHaveBeenCalled();
         }
       },

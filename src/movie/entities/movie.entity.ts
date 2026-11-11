@@ -1,7 +1,9 @@
-import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
+import { Column, Entity, Index, PrimaryGeneratedColumn } from 'typeorm';
 import { Genre } from 'src/types';
 
 @Entity()
+// Non-unique: backs the duplicate check in MovieService.create.
+@Index(['title', 'releaseDate'])
 export class Movie {
   @PrimaryGeneratedColumn()
   id: number;

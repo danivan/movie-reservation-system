@@ -1,8 +1,14 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   CUSTOM_ROUTE_ARGS_METADATA,
+  GUARDS_METADATA,
   ROUTE_ARGS_METADATA,
 } from '@nestjs/common/constants';
+import { ThrottlerGuard } from '@nestjs/throttler';
+import {
+  THROTTLER_LIMIT,
+  THROTTLER_TTL,
+} from '@nestjs/throttler/dist/throttler.constants';
 import { ParseIdPipe } from 'src/pipes/parse-id.pipe';
 import { ROLES_KEY } from 'src/decorators/role.decorator';
 import { IS_PUBLIC_KEY } from 'src/decorators/public.decorator';
@@ -62,7 +68,12 @@ describe('MovieController', () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [MovieController],
       providers: [{ provide: MovieService, useValue: mockMovieService }],
-    }).compile();
+    })
+      // The rate limit itself is covered in test/movie.e2e-spec.ts; here the
+      // guard only needs to resolve without ThrottlerModule.
+      .overrideGuard(ThrottlerGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = module.get<MovieController>(MovieController);
   });
@@ -158,6 +169,45 @@ describe('MovieController', () => {
     it('should not mark the controller class as public', () => {
       expect(
         Reflect.getMetadata(IS_PUBLIC_KEY, MovieController),
+      ).toBeUndefined();
+    });
+  });
+
+  describe('throttle', () => {
+    const OTHER_METHODS = ['findOne', ...WRITE_METHODS] as const;
+    const guardsOf = (target: object): unknown[] =>
+      Reflect.getMetadata(GUARDS_METADATA, target) ?? [];
+
+    it('should guard findAll with ThrottlerGuard', () => {
+      expect(guardsOf(MovieController.prototype.findAll)).toEqual([
+        ThrottlerGuard,
+      ]);
+    });
+
+    it('should limit findAll to 100 requests per 60000 ms', () => {
+      const findAll = MovieController.prototype.findAll;
+
+      expect(Reflect.getMetadata(`${THROTTLER_LIMIT}default`, findAll)).toBe(
+        100,
+      );
+      expect(Reflect.getMetadata(`${THROTTLER_TTL}default`, findAll)).toBe(
+        60000,
+      );
+    });
+
+    it.each(OTHER_METHODS)('should not throttle %s', (method) => {
+      const handler = MovieController.prototype[method];
+
+      expect(guardsOf(handler)).toEqual([]);
+      expect(
+        Reflect.getMetadata(`${THROTTLER_LIMIT}default`, handler),
+      ).toBeUndefined();
+    });
+
+    it('should not guard or throttle the controller class', () => {
+      expect(guardsOf(MovieController)).toEqual([]);
+      expect(
+        Reflect.getMetadata(`${THROTTLER_LIMIT}default`, MovieController),
       ).toBeUndefined();
     });
   });

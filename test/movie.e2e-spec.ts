@@ -383,15 +383,83 @@ describe('Movie (e2e)', () => {
       expect(row.posterUrl).toBe(posterUrl);
     });
 
-    it('should create two movies with different ids for the same body', async () => {
-      const body = makeMovieBody();
+    describe('duplicates (same title, description and release date)', () => {
+      const DUPLICATE_RESPONSE = {
+        statusCode: 409,
+        message:
+          'A movie with this title, description and release date already exists',
+        error: 'Conflict',
+      };
 
-      const first = await createMovie(body).expect(201);
-      const second = await createMovie(body).expect(201);
+      it('should reject a repeated POST with 409 and keep one row', async () => {
+        const body = makeMovieBody();
 
-      expect(second.body.id).not.toBe(first.body.id);
-      const count = await movies().countBy({ title: body.title });
-      expect(count).toBe(2);
+        await createMovie(body).expect(201);
+        const second = await createMovie(body).expect(409);
+
+        expect(second.body).toEqual(DUPLICATE_RESPONSE);
+        expect(await movies().countBy({ title: body.title })).toBe(1);
+      });
+
+      it('should treat bodies that differ only in padding as duplicates (trimmed first)', async () => {
+        const body = makeMovieBody();
+
+        await createMovie(body).expect(201);
+        await createMovie({
+          ...body,
+          title: `  ${body.title} `,
+          description: ` ${body.description}  `,
+        }).expect(409);
+
+        expect(await movies().countBy({ title: body.title })).toBe(1);
+      });
+
+      it('should create exactly one row for two concurrent identical POSTs', async () => {
+        const body = makeMovieBody();
+
+        const statuses = (
+          await Promise.all([createMovie(body), createMovie(body)])
+        )
+          .map((res) => res.status)
+          .sort();
+
+        expect(statuses).toEqual([201, 409]);
+        expect(await movies().countBy({ title: body.title })).toBe(1);
+      });
+
+      it('should ignore duration, genre and poster when matching', async () => {
+        const body = makeMovieBody();
+
+        await createMovie(body).expect(201);
+        await createMovie({
+          ...body,
+          durationMinutes: 599,
+          genre: 'drama',
+          posterUrl: 'https://example.com/other.jpg',
+        }).expect(409);
+      });
+
+      it.each([
+        ['a different release date (a remake)', { releaseDate: '1999-01-01' }],
+        ['a different description', { description: 'Another cut.' }],
+      ])('should allow the same title with %s', async (_label, change) => {
+        const body = makeMovieBody();
+
+        const first = await createMovie(body).expect(201);
+        const second = await createMovie({ ...body, ...change }).expect(201);
+
+        expect(second.body.id).not.toBe(first.body.id);
+        expect(await movies().countBy({ title: body.title })).toBe(2);
+      });
+
+      it('should allow re-creating a movie after it was deleted', async () => {
+        const body = makeMovieBody();
+
+        const first = await createMovie(body).expect(201);
+        await deleteMovie(first.body.id).expect(200);
+
+        await createMovie(body).expect(201);
+      });
     });
 
     const INVALID_BODIES: [string, Record<string, unknown>, string][] = [
@@ -652,6 +720,48 @@ describe('Movie (e2e)', () => {
       await deleteMovie(created.body.id).expect(200);
 
       logging.expectNoLogging();
+    });
+
+    it('should not log on a rejected duplicate POST', async () => {
+      const body = makeMovieBody();
+      await createMovie(body).expect(201);
+      const logging = spyOnAllLogging();
+
+      await createMovie(body).expect(409);
+
+      logging.expectNoLogging();
+    });
+  });
+
+  // Keep this last: it exhausts GET /movie's per-IP quota for this app
+  // instance, and earlier tests' GET /movie calls count toward it.
+  describe('rate limit', () => {
+    it('should advertise a limit of 100 on GET /movie', async () => {
+      const res = await request(server()).get('/movie').expect(200);
+
+      expect(res.headers['x-ratelimit-limit']).toBe('100');
+    });
+
+    it('should give 429 on GET /movie once 100 requests are used, without throttling GET /movie/:id', async () => {
+      const first = await request(server()).get('/movie').expect(200);
+      const remaining = Number(first.headers['x-ratelimit-remaining']);
+      expect(remaining).toBeGreaterThanOrEqual(0);
+      expect(remaining).toBeLessThan(100);
+
+      for (let i = 0; i < remaining; i++) {
+        await request(server()).get('/movie').expect(200);
+      }
+
+      const blocked = await request(server()).get('/movie').expect(429);
+      expect(blocked.headers['retry-after']).toBeDefined();
+
+      const seeded = await seedMovie();
+      await request(server()).get(`/movie/${seeded.id}`).expect(200);
+      expect(
+        (await request(server()).get(`/movie/${seeded.id}`)).headers[
+          'x-ratelimit-limit'
+        ],
+      ).toBeUndefined();
     });
   });
 });

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   HttpException,
   Injectable,
   InternalServerErrorException,
@@ -22,10 +23,29 @@ export class MovieService {
     private movieRepository: Repository<Movie>,
   ) {}
 
+  // Rejects an accidental double submit: a movie with the same title,
+  // description and release date gives 409. There is no unique index (a
+  // 5000-char description is too large for a btree), so the check runs
+  // under a transaction-scoped advisory lock on title + release date. Two
+  // concurrent identical requests then can't both pass the check.
   async create(createMovieDto: CreateMovieDto): Promise<Movie> {
+    const { title, description, releaseDate } = createMovieDto;
+
     try {
-      const movie = this.movieRepository.create(createMovieDto);
-      return await this.movieRepository.save(movie);
+      return await this.movieRepository.manager.transaction(async (manager) => {
+        await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+          `movie:${JSON.stringify([title, releaseDate])}`,
+        ]);
+
+        const movies = manager.getRepository(Movie);
+        if (await movies.existsBy({ title, description, releaseDate })) {
+          throw new ConflictException(
+            'A movie with this title, description and release date already exists',
+          );
+        }
+
+        return movies.save(movies.create(createMovieDto));
+      });
     } catch (error) {
       throw this.toHttpError(error, 'create');
     }
@@ -74,7 +94,9 @@ export class MovieService {
 
   // Maps a write failure to an HTTP error. Logs only the error's name,
   // message and stack: TypeORM's query/parameters hold the request data.
-  // Movie has no unique column, so a 23505 is unexpected and becomes a 500.
+  // Movie has no unique column, so a 23505 is unexpected and becomes a 500;
+  // duplicates are caught in create() as a ConflictException, which passes
+  // through here unchanged.
   private toHttpError(
     error: unknown,
     action: 'create' | 'update' | 'remove',
