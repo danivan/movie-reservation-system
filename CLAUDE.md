@@ -45,13 +45,16 @@ src/
   app.controller.ts        POST /auth/login, POST /auth/register
   auth/                    AuthService, Passport local + JWT strategies, guards, dto/register.dto.ts
   user/                    UserModule: controller, service, dto/, entities/
+  movie/                   MovieModule: public reads, admin writes; controller, service, dto/, entities/
+  common/                  shared helpers, e.g. string-validation.ts (trim, NO_NUL) for DTOs
   pipes/                   ParseIdPipe (numeric ids within the Postgres integer range)
   decorators/              @Public(), @Roles(...), @IdParam()
-  types/index.ts           shared enums (Role)
+  types/index.ts           shared enums (Role, Genre)
 test/                      e2e tests + jest-e2e.json; utils/ holds shared test helpers
 ```
 
-- **Auth is global.** `JwtAuthGuard` and `RolesGuard` are registered as `APP_GUARD`, so every route requires a Bearer JWT unless marked `@Public()`. Restrict to admins with `@Roles(Role.ADMIN)`.
+- **Auth is global.** `JwtAuthGuard` and `RolesGuard` are registered as `APP_GUARD`, so every route requires a Bearer JWT unless marked `@Public()`. Restrict to admins with `@Roles(Role.ADMIN)`. Catalogue resources follow `MovieController`: `@Public()` on the `GET` routes and `@Roles(Role.ADMIN)` on every write.
+- **Rate limiting** is opt-in per route. `ThrottlerModule.forRoot` is registered in `app.module.ts`, but `ThrottlerGuard` is not an `APP_GUARD`. A route opts in with `@UseGuards(ThrottlerGuard)` + `@Throttle(...)` (today only `GET /movie`: 100 per 60 s per client IP). Counts are in-memory per app instance and keyed on `req.ip`, so behind a proxy `trust proxy` must be set. In controller unit tests, stub the guard with `overrideGuard(ThrottlerGuard)`.
 - **Validation is global and strict.** `APP_PIPE` applies `validationPipeOptions`, so request bodies must match their DTO's class-validator rules and unknown fields get a 400. Register with `RegisterDto` (no `isAdmin`); `signUp` also forces `isAdmin: false`. Login (passport-local) runs before pipes, so `AuthService.validateUser` type-checks its own inputs and rejects NUL bytes. Names reject NUL bytes too, because Postgres text columns can't store U+0000.
 - **Params:** with `transform: true`, the global pipe coerces `@Param`/`@Query` values typed `number` with `+value`, so `0x10` becomes 16 before any param pipe sees it. Use `@IdParam()` from `src/decorators/id-param.decorator.ts` for `:id`. It is a custom decorator, so the global pipe skips it and `ParseIdPipe` receives the raw string: decimal digits only, in the range 1–2147483647.
 - **Passwords** are hashed only in `UserService` (`create`, `update`, and the public `hashPassword`). Never hash elsewhere, and never store a plaintext password.
@@ -82,12 +85,14 @@ test/                      e2e tests + jest-e2e.json; utils/ holds shared test h
 - **Controllers stay thin:** delegate to services; no business logic or repository access in controllers.
 - **Errors:**
   - Throw Nest HTTP exceptions from services, e.g. `NotFoundException` with messages like `User with ID ${id} not found`.
-  - Map DB errors by SQLSTATE code, not message text: `23505` → `ConflictException`. Anything else gets a generic `InternalServerErrorException` (`Failed to <action> user`) with no DB text (see `UserService.toHttpError`).
+  - Map DB errors by SQLSTATE code, not message text: `23505` → `ConflictException` (for tables with a unique column; `movie` has none, so there it is a 500).
+  - Duplicates that a unique index can't catch (e.g. `movie`'s title + `text` description + release date): check inside a transaction under `pg_advisory_xact_lock(hashtext($1))` keyed on the natural key, then throw `ConflictException` (see `MovieService.create`). A plain check-then-insert lets two concurrent requests both through. Anything else gets a generic `InternalServerErrorException` (`Failed to <action> user`) with no DB text (see `UserService.toHttpError`).
   - Do not throw bare `Error` in request paths; it becomes a 500 with no useful message. Startup config validation is the one exception.
 - **Logging:**
   - Never log request bodies, JWT payloads, `req.user`, emails or password hashes. No `console.*` in production code.
-  - Known gap (SPEC G19): an unexpected DB failure on an unwrapped read path (`findOne`, `findAll`, `findOneByEmail`) still reaches Nest's default exception handler, which logs the whole `QueryFailedError`, including its parameters.
+  - Known gap (SPEC G19): an unexpected DB failure on an unwrapped read path (`UserService` and `MovieService` `findOne`/`findAll`, `findOneByEmail`) still reaches Nest's default exception handler, which logs the whole `QueryFailedError`, including its parameters.
   - Use Nest `Logger`, logging only an error's name, message and stack, never TypeORM's `query` or `parameters`.
+  - Names and other free text reject NUL bytes via `NO_NUL` from `src/common/string-validation.ts`; don't redefine it per DTO.
 - **Library type mismatches:** when a config string must satisfy a narrower library type, cast at the call site with that library's own type (e.g. `as JwtSignOptions['expiresIn']` in [src/auth/auth.module.ts](src/auth/auth.module.ts)) rather than `any`.
 - **Async:** `async/await` everywhere; annotate service return types (`Promise<User>`).
 - **Config:** read config via `ConfigService`, never `process.env` outside `main.ts`. Use `configService.getOrThrow<string>('KEY')` for required values (NestJS 12's `@nestjs/jwt` and `passport-jwt` types reject `string | undefined`), and `get<T>()` only when there's a fallback (e.g. `JWT_SALT_OR_ROUNDS`). Use `forRootAsync`/`registerAsync` + `useFactory` for config-driven modules.
