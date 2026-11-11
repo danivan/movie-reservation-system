@@ -336,6 +336,23 @@ describe('Auth & User (e2e)', () => {
       await login(user.email, NEW_PASSWORD).expect(201);
     });
 
+    it('should reject an empty password with 400 and keep the stored hash', async () => {
+      const user = await seedUser();
+      const { password: storedHash } = await users().findOneByOrFail({
+        id: user.id,
+      });
+
+      const res = await patchUser(user.id, { password: '' }).expect(400);
+
+      expect(res.body.message).toEqual(
+        expect.arrayContaining([expect.stringContaining('password')]),
+      );
+      const row = await users().findOneByOrFail({ id: user.id });
+      // A boolean, so a failure never prints the hash.
+      expect(row.password === storedHash).toBe(true);
+      await login(user.email, PASSWORD).expect(201);
+    });
+
     it('should reject a null firstname with 400', async () => {
       const user = await seedUser();
 

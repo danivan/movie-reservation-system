@@ -76,6 +76,10 @@ describe('UpdateUserDto', () => {
       );
     });
 
+    it('should reject an empty-string password', async () => {
+      expect(await invalidProperties({ password: '' })).toContain('password');
+    });
+
     it('should reject a password longer than 72 characters', async () => {
       expect(await invalidProperties({ password: 'x'.repeat(73) })).toContain(
         'password',

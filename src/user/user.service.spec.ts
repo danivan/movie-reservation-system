@@ -487,6 +487,28 @@ describe('UserService', () => {
       },
     );
 
+    // Non-HTTP callers bypass UpdateUserDto's @MinLength(8), so the service
+    // itself must refuse a present-but-empty password.
+    it.each<UpdateUserDto>([
+      { password: '' },
+      { password: null as unknown as string },
+      { firstname: 'Jane', password: '' },
+      { firstname: 'Jane', password: null as unknown as string },
+    ])(
+      'should reject %p with BadRequestException before touching the DB',
+      async (dto) => {
+        const result = service.update(1, dto);
+
+        await expect(result).rejects.toThrow(BadRequestException);
+        await expect(result).rejects.toMatchObject({
+          message: 'password must not be empty',
+        });
+        expect(mockUserRepository.findOneBy).not.toHaveBeenCalled();
+        expect(bcrypt.hash).not.toHaveBeenCalled();
+        expect(mockUserRepository.update).not.toHaveBeenCalled();
+      },
+    );
+
     it('should throw ConflictException when the new email is taken', async () => {
       mockUserRepository.update.mockRejectedValue(uniqueViolation());
 
