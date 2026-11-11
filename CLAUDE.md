@@ -85,8 +85,8 @@ test/                      e2e tests + jest-e2e.json; utils/ holds shared test h
 - **Controllers stay thin:** delegate to services; no business logic or repository access in controllers.
 - **Errors:**
   - Throw Nest HTTP exceptions from services, e.g. `NotFoundException` with messages like `User with ID ${id} not found`.
-  - Map DB errors by SQLSTATE code, not message text: `23505` → `ConflictException` (for tables with a unique column; `movie` has none, so there it is a 500).
-  - Duplicates that a unique index can't catch (e.g. `movie`'s title + `text` description + release date): check inside a transaction under `pg_advisory_xact_lock(hashtext($1))` keyed on the natural key, then throw `ConflictException` (see `MovieService.create`). A plain check-then-insert lets two concurrent requests both through. Anything else gets a generic `InternalServerErrorException` (`Failed to <action> user`) with no DB text (see `UserService.toHttpError`).
+  - Map DB errors by SQLSTATE code, not message text: `23505` → `ConflictException` (for tables with a unique column; `movie` has none, so there it is a 500). Anything else gets a generic `InternalServerErrorException` (`Failed to <action> user`) with no DB text (see `UserService.toHttpError`).
+  - Duplicates that a unique index can't catch (e.g. `movie`'s title + `text` description + release date): check inside a `READ COMMITTED` transaction under `pg_advisory_xact_lock(hashtext($1))` keyed on the natural key, then throw `ConflictException` (see `MovieService.create`). A plain check-then-insert lets two concurrent requests both through, and a stricter isolation level would hide the row committed while waiting on the lock.
   - Do not throw bare `Error` in request paths; it becomes a 500 with no useful message. Startup config validation is the one exception.
 - **Logging:**
   - Never log request bodies, JWT payloads, `req.user`, emails or password hashes. No `console.*` in production code.

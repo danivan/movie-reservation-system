@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { getStorageToken, ThrottlerStorageService } from '@nestjs/throttler';
 import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
 import { randomBytes } from 'crypto';
@@ -414,16 +415,19 @@ describe('Movie (e2e)', () => {
         expect(await movies().countBy({ title: body.title })).toBe(1);
       });
 
-      it('should create exactly one row for two concurrent identical POSTs', async () => {
+      // Probabilistic: five simultaneous requests make it likely that two
+      // interleave between check and insert, which only the lock prevents.
+      // The unit spec pins the lock itself deterministically.
+      it('should create exactly one row for five concurrent identical POSTs', async () => {
         const body = makeMovieBody();
 
         const statuses = (
-          await Promise.all([createMovie(body), createMovie(body)])
+          await Promise.all(Array.from({ length: 5 }, () => createMovie(body)))
         )
           .map((res) => res.status)
           .sort();
 
-        expect(statuses).toEqual([201, 409]);
+        expect(statuses).toEqual([201, 409, 409, 409, 409]);
         expect(await movies().countBy({ title: body.title })).toBe(1);
       });
 
@@ -437,6 +441,8 @@ describe('Movie (e2e)', () => {
           genre: 'drama',
           posterUrl: 'https://example.com/other.jpg',
         }).expect(409);
+
+        expect(await movies().countBy({ title: body.title })).toBe(1);
       });
 
       it.each([
@@ -734,7 +740,7 @@ describe('Movie (e2e)', () => {
   });
 
   // Keep this last: it exhausts GET /movie's per-IP quota for this app
-  // instance, and earlier tests' GET /movie calls count toward it.
+  // instance, which would 429 any later GET /movie.
   describe('rate limit', () => {
     it('should advertise a limit of 100 on GET /movie', async () => {
       const res = await request(server()).get('/movie').expect(200);
@@ -742,26 +748,29 @@ describe('Movie (e2e)', () => {
       expect(res.headers['x-ratelimit-limit']).toBe('100');
     });
 
-    it('should give 429 on GET /movie once 100 requests are used, without throttling GET /movie/:id', async () => {
-      const first = await request(server()).get('/movie').expect(200);
-      const remaining = Number(first.headers['x-ratelimit-remaining']);
-      expect(remaining).toBeGreaterThanOrEqual(0);
-      expect(remaining).toBeLessThan(100);
+    it('should allow exactly 100 GET /movie requests, give 429 on the 101st, and not throttle GET /movie/:id', async () => {
+      // Start from an empty counter, so earlier tests' hits (and their 60 s
+      // expiry during this loop) can't move the boundary. storage.clear()
+      // is not enough: the count is rebuilt from a second map of hit
+      // expirations. onApplicationShutdown() clears both, and the sweep
+      // timer restarts on the next hit.
+      app
+        .get<ThrottlerStorageService>(getStorageToken())
+        .onApplicationShutdown();
 
-      for (let i = 0; i < remaining; i++) {
-        await request(server()).get('/movie').expect(200);
+      for (let i = 1; i <= 100; i++) {
+        const res = await request(server()).get('/movie').expect(200);
+        expect(res.headers['x-ratelimit-remaining']).toBe(String(100 - i));
       }
 
       const blocked = await request(server()).get('/movie').expect(429);
-      expect(blocked.headers['retry-after']).toBeDefined();
+      expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
 
       const seeded = await seedMovie();
-      await request(server()).get(`/movie/${seeded.id}`).expect(200);
-      expect(
-        (await request(server()).get(`/movie/${seeded.id}`)).headers[
-          'x-ratelimit-limit'
-        ],
-      ).toBeUndefined();
+      const byId = await request(server())
+        .get(`/movie/${seeded.id}`)
+        .expect(200);
+      expect(byId.headers['x-ratelimit-limit']).toBeUndefined();
     });
   });
 });

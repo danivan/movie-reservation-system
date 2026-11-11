@@ -213,9 +213,13 @@ describe('MovieService', () => {
     // resetAllMocks (not clearAllMocks) so no implementation or *Once queue
     // leaks from one test into the next; every default is re-stubbed below.
     jest.resetAllMocks();
+    // transaction(work) or transaction(isolationLevel, work): the callback
+    // is always the last argument.
     mockMovieRepository.manager.transaction.mockImplementation(
-      async (work: (manager: typeof mockTxManager) => Promise<unknown>) =>
-        work(mockTxManager),
+      async (...args: unknown[]) =>
+        (args[args.length - 1] as (m: typeof mockTxManager) => unknown)(
+          mockTxManager,
+        ),
     );
     mockTxManager.getRepository.mockImplementation((entity) =>
       entity === Movie ? mockTxRepository : undefined,
@@ -299,6 +303,18 @@ describe('MovieService', () => {
         releaseDate: '2016-11-11',
         marker: CREATED_MARKER,
       });
+    });
+
+    // Lock-then-check is only race-free if existsBy takes a fresh snapshot
+    // after the lock is granted, i.e. under READ COMMITTED. Pin it so a
+    // stricter DB default can't let two concurrent duplicates through.
+    it('should run in a READ COMMITTED transaction', async () => {
+      await service.create(makeCreateMovieDto());
+
+      expect(mockMovieRepository.manager.transaction).toHaveBeenCalledWith(
+        'READ COMMITTED',
+        expect.any(Function),
+      );
     });
 
     it('should take a transaction-scoped advisory lock keyed on title and release date, as a bound parameter', async () => {

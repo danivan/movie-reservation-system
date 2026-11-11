@@ -5,6 +5,9 @@ import {
   ROUTE_ARGS_METADATA,
 } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
+// Deliberate internal import: these keys aren't re-exported from the package
+// root. @nestjs/throttler is pinned to ~6.7 in package.json, so a move of this
+// file fails compilation here rather than silently passing.
 import {
   THROTTLER_LIMIT,
   THROTTLER_TTL,

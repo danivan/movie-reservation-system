@@ -28,7 +28,7 @@
   - Optional `?genre=<Genre>` filter.
   - Ordered by `title ASC, id ASC`.
   - Returns `[]` when nothing matches (not a 404).
-  - Rate-limited to 100 requests per 60 s per client IP (`@UseGuards(ThrottlerGuard)` + `@Throttle`); the 101st gives 429 with `Retry-After`. `ThrottlerModule.forRoot` in `app.module.ts`; the guard is not global, so no other route is limited. Counts are in-memory per app instance.
+  - Rate-limited to 100 requests per 60 s per client IP (`@UseGuards(ThrottlerGuard)` + `@Throttle`); the 101st gives 429 with `Retry-After`. `ThrottlerModule.forRoot` in `app.module.ts`; the guard is not global, so no other route is limited. Counts are in-memory per app instance. Assumes direct exposure: behind a proxy, `req.ip` is the proxy, so all clients share one quota until `trust proxy` is set (follow-up: a hop count from config, never `true`).
 - `GET /movie/:id`: `@Public()`. Returns 404 `Movie with ID ${id} not found` when it doesn't exist.
 - `POST /movie`: `@Roles(Role.ADMIN)`. Returns 201 with the created movie, or 409 when a movie with the same title, description and release date exists (an accidental double submit).
 - `PATCH /movie/:id`: `@Roles(Role.ADMIN)`. Returns 200 with the movie **reloaded** from the DB.
@@ -61,7 +61,7 @@
   - Throws 400 `No fields to update` when every value is `undefined`, before any DB call.
   - `{ posterUrl: null }` is **not** empty.
   - Then it checks the movie exists (404), updates, and returns `findOne(id)`.
-- `create`: in one transaction:
+- `create`: in one `READ COMMITTED` transaction (pinned explicitly; under a stricter level the check would not see a row committed while waiting on the lock):
   - Takes `pg_advisory_xact_lock(hashtext($1))` keyed on title + release date (bound parameter), so concurrent identical requests serialize.
   - `existsBy({ title, description, releaseDate })` (after trimming, exact match); if found, 409 `A movie with this title, description and release date already exists`, with no request data in the body and nothing logged.
   - Otherwise `create` + `save` through the transaction's repository.
@@ -127,6 +127,7 @@
   - `IS_PUBLIC_KEY` on `findAll`/`findOne` only.
   - Each method passes its exact arguments to the service.
   - `findAll` alone has `ThrottlerGuard` with limit 100 and ttl 60000.
+- **`movie.entity.spec.ts`:** one non-unique index, on `(title, releaseDate)`.
 
 ### E2E (`npm run test:e2e`, `test/movie.e2e-spec.ts`)
 - **Harness:** same as `test/auth-user.e2e-spec.ts:75-97`.
@@ -150,13 +151,13 @@
 - **Writes:**
   - `POST` gives 201 with trimmed strings.
   - Posting the same body twice gives 409 and one row, also when the second body differs only in padding or in duration, genre or poster.
-  - Two concurrent identical `POST`s give one 201 and one 409, and one row.
+  - Five concurrent identical `POST`s give one 201 and four 409s, and one row (probabilistic; the unit spec pins the lock).
   - The same title with a different release date or description gives 201; re-creating a deleted movie gives 201.
   - `PATCH { durationMinutes: 150 }` changes only that field.
   - `PATCH { posterUrl: null }` clears it in the DB.
   - After `DELETE`, a `GET` gives 404.
 - **Logging:** `spyOnAllLogging()` records nothing across a successful `POST` → `PATCH` → `DELETE`, or on a rejected duplicate `POST`.
-- **Rate limit** (last, it uses up the quota): `GET /movie` sends `X-RateLimit-Limit: 100`, gives 429 with `Retry-After` once the quota is used, and `GET /movie/:id` is not limited.
+- **Rate limit** (last, it uses up the quota): `GET /movie` sends `X-RateLimit-Limit: 100`. After clearing the throttler storage, exactly 100 requests give 200 (with `X-RateLimit-Remaining` counting down to 0) and the 101st gives 429 with `Retry-After` > 0. `GET /movie/:id` is not limited.
 
 ### Manual (`npm run start:dev`)
 - **Setup:**

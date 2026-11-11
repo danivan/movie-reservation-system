@@ -27,25 +27,30 @@ export class MovieService {
   // description and release date gives 409. There is no unique index (a
   // 5000-char description is too large for a btree), so the check runs
   // under a transaction-scoped advisory lock on title + release date. Two
-  // concurrent identical requests then can't both pass the check.
+  // concurrent identical requests then can't both pass the check. READ
+  // COMMITTED is pinned: existsBy must see rows committed while it waited on
+  // the lock, which a REPEATABLE READ snapshot (taken at the lock) would not.
   async create(createMovieDto: CreateMovieDto): Promise<Movie> {
     const { title, description, releaseDate } = createMovieDto;
 
     try {
-      return await this.movieRepository.manager.transaction(async (manager) => {
-        await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
-          `movie:${JSON.stringify([title, releaseDate])}`,
-        ]);
+      return await this.movieRepository.manager.transaction(
+        'READ COMMITTED',
+        async (manager) => {
+          await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+            `movie:${JSON.stringify([title, releaseDate])}`,
+          ]);
 
-        const movies = manager.getRepository(Movie);
-        if (await movies.existsBy({ title, description, releaseDate })) {
-          throw new ConflictException(
-            'A movie with this title, description and release date already exists',
-          );
-        }
+          const movies = manager.getRepository(Movie);
+          if (await movies.existsBy({ title, description, releaseDate })) {
+            throw new ConflictException(
+              'A movie with this title, description and release date already exists',
+            );
+          }
 
-        return movies.save(movies.create(createMovieDto));
-      });
+          return movies.save(movies.create(createMovieDto));
+        },
+      );
     } catch (error) {
       throw this.toHttpError(error, 'create');
     }
