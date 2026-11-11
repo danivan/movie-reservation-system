@@ -1,53 +1,68 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
-import { CreateUserDto } from 'src/user/dto/create-user.dto';
+import { RegisterDto } from './dto/register.dto';
 import * as bcrypt from 'bcrypt';
 import { User } from 'src/user/entities/user.entity';
-import { ConfigService } from '@nestjs/config';
+import { randomBytes } from 'crypto';
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleInit {
+  private dummyHash?: Promise<string>;
+
   constructor(
-    private usersService: UserService,
-    private jwtService: JwtService,
-    private configService: ConfigService,
+    private readonly usersService: UserService,
+    private readonly jwtService: JwtService,
   ) {}
 
-  private saltOrRounds =
-    Number(this.configService.get<string>('JWT_SALT_OR_ROUNDS')) || 10;
-
-  async validateUser(email: string, pass: string): Promise<any> {
-    const user = await this.usersService.findOneByEmail(email);
-
-    const isMatch = user && (await bcrypt.compare(pass, user.password));
-
-    if (isMatch) {
-      const { password, ...result } = user;
-      return result;
-    }
-    return null;
+  onModuleInit(): void {
+    // Warm the dummy hash so the first unknown-email login isn't slower (G7).
+    this.getDummyHash().catch(() => undefined);
   }
 
-  async signUp(payload: CreateUserDto): Promise<User> {
-    if (!payload) {
-      throw new Error('Invalid user data');
+  private getDummyHash(): Promise<string> {
+    // Clear the cache on rejection so the next caller retries.
+    return (this.dummyHash ??= this.usersService
+      .hashPassword(randomBytes(16).toString('hex'))
+      .catch((error: unknown) => {
+        this.dummyHash = undefined;
+        throw error;
+      }));
+  }
+
+  async validateUser(
+    email: unknown,
+    pass: unknown,
+  ): Promise<Omit<User, 'password'> | null> {
+    // Login bypasses the ValidationPipe; reject non-strings before any work.
+    if (typeof email !== 'string' || typeof pass !== 'string') {
+      return null;
+    }
+    // Postgres rejects U+0000 in text, so the lookup would 500.
+    if (email.includes('\u0000')) {
+      return null;
     }
 
-    const hashPass = await bcrypt.hash(payload.password, this.saltOrRounds);
+    const normalised = email.trim().toLowerCase();
+    const user = await this.usersService.findOneByEmail(normalised);
 
-    const data = {
-      ...payload,
-      password: hashPass,
-    };
-
-    try {
-      return await this.usersService.create(data);
-    } catch (error) {
-      throw new InternalServerErrorException(
-        `Failed to create user: ${error.message}`,
-      );
+    if (!user) {
+      // Equalise timing with the wrong-password path (G7).
+      await bcrypt.compare(pass, await this.getDummyHash());
+      return null;
     }
+
+    const isMatch = await bcrypt.compare(pass, user.password);
+    if (!isMatch) {
+      return null;
+    }
+
+    const { password, ...result } = user;
+    return result;
+  }
+
+  async signUp(payload: RegisterDto): Promise<User> {
+    return this.usersService.create({ ...payload, isAdmin: false });
   }
 
   async login(user: User) {

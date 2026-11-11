@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppController } from './app.controller';
 import { AuthService } from './auth/auth.service';
+import { RegisterDto } from './auth/dto/register.dto';
 
 describe('AppController', () => {
   let appController: AppController;
@@ -10,7 +11,9 @@ describe('AppController', () => {
   };
 
   beforeEach(async () => {
-    jest.clearAllMocks();
+    // resetAllMocks so no implementation or *Once queue leaks between tests;
+    // each test stubs the service calls it relies on.
+    jest.resetAllMocks();
 
     const app: TestingModule = await Test.createTestingModule({
       controllers: [AppController],
@@ -34,20 +37,30 @@ describe('AppController', () => {
   });
 
   describe('register', () => {
-    it('should sign up a user with the request body', async () => {
-      const body = {
+    it('should pass the register DTO itself to signUp', async () => {
+      const dto = {
         firstname: 'John',
         lastname: 'Doe',
         email: 'john@example.com',
-        password: 'secret',
+        password: 'password123',
       };
-      const created = { id: 1, ...body };
+      const created = { id: 1, ...dto, isAdmin: false };
       mockAuthService.signUp.mockResolvedValue(created);
 
-      const result = await appController.register({ body });
+      const result = await appController.register(dto);
 
-      expect(mockAuthService.signUp).toHaveBeenCalledWith(body);
+      expect(mockAuthService.signUp.mock.calls[0][0]).toBe(dto);
       expect(result).toEqual(created);
+    });
+
+    it('should type the register body parameter as RegisterDto', () => {
+      const paramTypes = Reflect.getMetadata(
+        'design:paramtypes',
+        AppController.prototype,
+        'register',
+      );
+
+      expect(paramTypes[0]).toBe(RegisterDto);
     });
   });
 });
