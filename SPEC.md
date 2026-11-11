@@ -1,257 +1,171 @@
-# SPEC: Harden auth & user endpoints (TDD)
+# SPEC: Movie module
 
-## Context
-A review of the request flow found these defects in the auth and user routes:
+## Goal
+- Anyone can browse movies, with or without logging in. Admins can create, update and delete them.
+- Follow the patterns of the `user` module and [CLAUDE.md](CLAUDE.md).
+- Gap IDs (G1, G9, G17, G21) refer to the earlier auth-hardening spec: `git show 18203cb:SPEC.md`.
 
-| # | Defect | Impact |
-|---|---|---|
-| 1 | `POST /auth/register` passes `req.body` straight to the DB, and no validation runs | Anyone can self-register with `"isAdmin": true` (privilege escalation) |
-| 2 | `POST /user` and `PATCH /user/:id` store `password` without hashing | Plaintext passwords in the DB; those users can't log in |
-| 3 | Login with an unknown email throws `NotFoundException` | Returns 404 instead of 401, which reveals which emails are registered |
-| 4 | Wrong status codes and return values | Duplicate email → 500, `/user/abc` → 500, `PATCH` returns `UpdateResult`, bare `Error`s → 500 |
-| 6 | `console.log` in `JwtStrategy` and `RolesGuard` | JWT payloads and user data (emails) logged on every authenticated request (`JwtStrategy`) and every `@Roles` route (`RolesGuard`) |
+## Out of scope
+- Pagination, title search, multiple genres per movie, `createdAt`/`updatedAt` columns.
+- Delete behaviour once showtimes reference movies (decide this in the showtime spec).
+- Refactoring `UserService` (e.g. a shared `toHttpError`).
 
-Out of scope: finding 5 (role taken from the JWT / `GET /user` open to all users) and finding 10 (dead code).
+## Requirements
 
-Branch: `feature/JIRA-<id>-harden-auth-user`, currently `feature/harden-auth-user` until a JIRA id is assigned; rename before opening the PR. Conventional Commits.
+### Data: `Movie` entity (`src/movie/entities/movie.entity.ts`)
+- `id`: serial PK.
+- `title`: `varchar(200)`, required, **not unique** (remakes share titles).
+- `description`: `text`, required.
+- `durationMinutes`: `int`, required.
+- `genre`: Postgres enum of the new `Genre` enum, required.
+- `releaseDate`: `date`, returned as a `'YYYY-MM-DD'` string.
+- `posterUrl`: `varchar(2048)`, nullable. Declare `type: 'varchar'` explicitly, because the field is typed `string | null`.
+- `Genre` goes in [src/types/index.ts](src/types/index.ts) after line 4: `action`, `animation`, `comedy`, `documentary`, `drama`, `horror`, `romance`, `sci-fi`, `thriller`.
 
-## Gaps found while reviewing the first draft of this plan
-These are now part of the plan:
+### Endpoints (`@Controller('movie')`)
+- `GET /movie`: `@Public()`.
+  - Optional `?genre=<Genre>` filter.
+  - Ordered by `title ASC, id ASC`.
+  - Returns `[]` when nothing matches (not a 404).
+- `GET /movie/:id`: `@Public()`. Returns 404 `Movie with ID ${id} not found` when it doesn't exist.
+- `POST /movie`: `@Roles(Role.ADMIN)`. Returns 201 with the created movie.
+- `PATCH /movie/:id`: `@Roles(Role.ADMIN)`. Returns 200 with the movie **reloaded** from the DB.
+- `DELETE /movie/:id`: `@Roles(Role.ADMIN)`. Returns 200 with an empty body, the same as `DELETE /user/:id`.
+- Every `:id` uses `@IdParam()` (G17), so `abc`, `0`, `0x10`, `1e3` and `2147483648` all give 400.
+- Writes without a token give 401; writes from a non-admin give 403.
 
-| Gap | Why it matters | Resolution |
-|---|---|---|
-| **G1. Silent admin demotion.** `PartialType` from `@nestjs/mapped-types` copies property initializers (`inheritPropertyInitializers`). Once `ValidationPipe({ transform: true })` runs, `PATCH {"password": "..."}` becomes `{password, isAdmin: false}` | Any password change would demote an admin | Remove the `= false` initializer from `CreateUserDto` (the entity column already defaults to `false`). Add a test that a transformed `UpdateUserDto` has no `isAdmin` key |
-| **G2. Email case.** The unique constraint is case-sensitive | `A@x.dev` and `a@x.dev` become two accounts, so the 409 check is bypassable, and login is case-sensitive | `@Transform` trim + lowercase on `email` in the DTO; lowercase `username` in `validateUser` |
-| **G3. bcrypt truncates at 72 bytes** | Long passwords silently match on their first 72 bytes | `@MaxLength(72)` on `password` |
-| **G4. Empty PATCH body** (`{}`) | TypeORM throws `UpdateValuesMissingError` → 500 | `update` throws `BadRequestException('No fields to update')` when no field in the DTO is defined |
-| **G5. DB internals leak in 500 messages** (`` `Failed to ...: ${error.message}` ``) | Leaks SQL and constraint details to clients | Generic 500 message. Log the error with Nest `Logger` (no request body or PII) |
-| **G6. 409 message** | Must not echo the email | `ConflictException('Email already in use')` |
-| **G7. Timing-based enumeration** after the 404→401 fix | Unknown emails respond faster (no bcrypt work) | Compare against a dummy hash generated once with the same salt rounds. It is started at startup (`onModuleInit`, not awaited) so the first unknown-email login isn't measurably slower (review measured 123 ms vs ~50 ms when lazy). A failed hash is not cached, so it is retried rather than turning every unknown email into a 500. **Residual (accepted, see G10):** accounts hashed at a different cost, or still holding plaintext passwords, respond at a different speed |
-| **G8. E2E harness is broken.** `test/jest-e2e.json` has no `moduleNameMapper` for `src/...` imports, and the only e2e test hits a non-existent, guarded `GET /` | The e2e red phase can't run at all | Add `"moduleNameMapper": {"^src/(.*)$": "<rootDir>/../src/$1"}` and replace the `GET /` test |
-| **G9. No way to create an admin** once register can't set `isAdmin` | E2E admin scenarios have no admin; production has no bootstrap path | E2E: register a user, then set `isAdmin = true` via `DataSource` in `beforeAll`. Production bootstrap (seed script or CLI) is a **follow-up**; record it as an open issue |
-| **G10. Existing bad data** | Plaintext passwords and users who self-promoted already exist in the DB | **Follow-up**: one-off script to bcrypt-hash any password not matching `^\$2[aby]\$`, an audit of `isAdmin = true` rows, and lowercasing existing `user.email` values. Plaintext and differently-costed hashes also make login timing distinguishable (G7); consider rehash-on-login when the stored cost differs from `JWT_SALT_OR_ROUNDS`. Legacy mixed-case rows (e.g. `A@x.dev`) would otherwise escape the case-insensitive 409 check and, after Cycle 3, fail to log in; any rows that collide once lowercased must be resolved by hand. Not part of this change |
-| **G11. E2E isolation** | Tests write to the dev DB | Unique emails per run (`` `e2e-${Date.now()}-n@test.dev` ``), delete them in `afterAll`, and call `app.close()` |
-| **G12. Login body isn't validated by the pipe** | Passport runs before pipes | Acceptable: passport-local returns 401 for missing fields. Covered by an e2e test |
-| **G13. CI doesn't run e2e** | E2E regressions go unnoticed | DoD requires a local e2e run. Adding a Postgres service to CI is a follow-up |
-| **G14. Explicit `null` on PATCH** (found in review) | `PartialType` applies `@IsOptional()`, which skips validation for `null` too. `PATCH /user/:id {"firstname": null}` reaches a NOT NULL column → 500; after Cycle 2, `{"password": null}` would reach `bcrypt.hash(null)` | `PartialType(CreateUserDto, { skipNullProperties: false })`: `null` is validated and rejected (400), omitted fields are still skipped. `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of its own `@IsOptional()`, which would otherwise keep skipping `isAdmin: null` on both `POST /user` and `PATCH` |
-| **G15. Zero-width-only names** (found in review) | `String.prototype.trim` doesn't strip U+200B and similar characters, so a name that looks blank is accepted | **Accepted**: cosmetic only, no security impact. Revisit if display names matter |
-| **G16. Unvalidated `JWT_SALT_OR_ROUNDS`** (found in review) | `Number(v) \|\| 10` only falls back for unset/`0`/non-numeric. `"1"`, `"4.5"` silently give bcrypt cost 4 (weak hashes); `"-1"`, `"20"`, `"31"` hang hashing, and concurrent password writes exhaust the libuv threadpool and stall logins | `UserService` reads it once at construction: unset or empty → 10; otherwise it must be an integer 10–15, else the constructor throws an `Error` naming `JWT_SALT_OR_ROUNDS` so the app fails at startup (a startup config error, not an HTTP error, so a plain `Error` is acceptable here) |
-| **G17. Out-of-range ids** (found in review) | `ParseIntPipe` accepts any integer, but `user.id` is a Postgres `integer`. `/user/2147483648` (pg 22003) and `/user/99999999999999999999999` (22P02) fail in `findOne`, outside the error mapping, so the client gets a 500. Nest's default handler then logs the full `QueryFailedError` | `ParseIdPipe` (`src/pipes/parse-id.pipe.ts`) delegates to `ParseIntPipe` (non-numeric → 400 `Validation failed (numeric string is expected)`), then rejects ids outside 1–2147483647 with 400 `Validation failed (id must be between 1 and 2147483647)`. `0` and negative ids change from 404 to 400. **Found in the full-branch review:** with `transform: true`, the global `ValidationPipe` coerced `@Param` values typed `number` with `+value` before `ParseIdPipe` ran, so `0x10` was accepted as 16 and `1e3` as 1000. The id now comes from a custom `@IdParam()` decorator (`src/decorators/id-param.decorator.ts`), which the global pipe skips, so `ParseIdPipe` sees the raw string and only decimal digits pass |
-| **G18. Any 23505 → 409** (found in review) | `email` is the only unique column besides the PK. A PK collision after sequence drift (manual seed, restore) would report "Email already in use" | **Accepted**: matching is by SQLSTATE code, not message text, so it is locale-independent. Revisit if another unique column is added; then match `driverError.constraint` against a named email constraint |
-| **G19. Unwrapped read paths log full DB errors** (found in review) | `findOne`, `findAll` and `findOneByEmail` (login) aren't wrapped by `toHttpError`. A DB failure there reaches Nest's `ExceptionsHandler`, which logs the whole `QueryFailedError`, including `parameters` (the submitted email on login). The response stays a generic 500 | **Follow-up**: a global exception filter that logs only name/message/stack, or wrap the reads. The full-branch review found a client could trigger this on demand by sending a NUL byte in the login email (Postgres 22021). That path is now closed: `validateUser` rejects NUL, and the name DTOs reject NUL (G21). So what remains needs a genuine DB failure |
-| **G21. NUL bytes → 500** (found in full-branch review) | Postgres `text`/`varchar` rejects U+0000. A NUL in `firstname`/`lastname` passed validation, and the insert or update returned 500. A NUL in the login email reached `findOneByEmail` and returned 500, logging the full error (G19) | `@Matches(/^[^\u0000]*$/)` on `firstname`/`lastname` (inherited by `RegisterDto`/`UpdateUserDto`), so 400. `validateUser` returns `null` for an email containing NUL, so 401. Emails in DTOs were already safe (`@IsEmail` rejects NUL). **Passwords too** (full-branch test review): native bcrypt hashes an all-NUL password the same as an empty one, so `compare('\0', hash('\0'.repeat(8)))` is `true`. `password` gets the same no-NUL rule |
-| **G20. Register 409 reveals registered emails** (found in review) | G6/DoD 4 require 409 on duplicate register, which partly undoes Cycle 3's enumeration fix for login | **Accepted by spec; follow-up**: rate limiting, or a neutral response plus email verification |
+### Validation (`CreateMovieDto`, `UpdateMovieDto`, `FindMoviesQueryDto`)
+- `title`: trimmed, non-empty, at most 200 characters, no NUL.
+- `description`: trimmed, non-empty, at most 5000 characters, no NUL.
+- `durationMinutes`: an integer from 1 to 600.
+  - The string `'120'` is rejected; there is no implicit conversion.
+- `genre`: `@IsEnum(Genre)`.
+- `releaseDate`:
+  - Must match `^(18|19|20|21)\d{2}-\d{2}-\d{2}$` and pass `@IsISO8601({ strict: true })`.
+  - Rejects `2021-02-29`, `0000-01-01` and datetimes. Verified against the installed class-validator.
+- `posterUrl`: optional, an `https` URL with the protocol included, at most 2048 characters.
+  - `null` is allowed and clears the poster.
+  - Use `@ValidateIf((_, v) => v !== undefined && v !== null)`. Verified to work alongside `PartialType`.
+- `UpdateMovieDto` is `PartialType(CreateMovieDto, { skipNullProperties: false })`.
+  - An explicit `null` is rejected on every field except `posterUrl`.
+- No field initializers on any DTO (G1).
+- `FindMoviesQueryDto`: `genre` is optional and must be a `Genre` value.
+  - A repeated `?genre=a&genre=b`, an empty `?genre=` or an unknown query key gives 400.
+- An unknown body key, `id` included, gives 400 (global `forbidNonWhitelisted`).
 
-## Design decisions
-- **Global strict validation.** `APP_PIPE` = `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true })` in `AppModule`, not `main.ts`, so e2e tests get it. The options live in `src/validation-pipe.options.ts` (`validationPipeOptions`) so a unit spec can exercise the same configuration.
-- **Names are trimmed.** `firstname`/`lastname` get a trim `@Transform`, so whitespace-only names fail `@IsNotEmpty()`.
-- **`UpdateUserDto`** = `PartialType(CreateUserDto, { skipNullProperties: false })`, so omitted fields are optional but `null` is rejected (G14).
-- **`RegisterDto`** = `OmitType(CreateUserDto, ['isAdmin'] as const)`. `signUp` also forces `isAdmin: false`.
-- **Hashing only in `UserService`** (`create`, `update`, and the public `hashPassword` that `AuthService` uses for the dummy hash). `AuthService` no longer hashes. Salt rounds come from `JWT_SALT_OR_ROUNDS` (default 10), validated once at startup as an integer 10–15 (G16).
-- **`findOneByEmail` returns `User | null`.** Its only caller is `validateUser`.
-- **Unique violation** (`QueryFailedError`, `driverError.code === '23505'`) → `ConflictException`. Any other DB error → `InternalServerErrorException`. No bare `Error`s on request paths; the G16 startup check is the only exception.
-- **`ParseIdPipe` on every `:id`** in `UserController`. It wraps `ParseIntPipe` and adds the Postgres `integer` range check (G17).
+### Service (`MovieService`)
+- Mirrors [src/user/user.service.ts](src/user/user.service.ts), without the hashing or config.
+- `update`:
+  - Throws 400 `No fields to update` when every value is `undefined`, before any DB call.
+  - `{ posterUrl: null }` is **not** empty.
+  - Then it checks the movie exists (404), updates, and returns `findOne(id)`.
+- `remove`: checks the movie exists (404), then deletes it.
+- Write errors (`create`, `update`, `remove`):
+  - An `HttpException` passes through unchanged.
+  - Anything else becomes 500 `Failed to <action> movie`. That includes `23505`; there's no 409, because `movie` has no unique column.
+- Logging on a failed write: Nest `Logger` with the error's name, message and stack only (cf. `user.service.ts:119-144`). No TypeORM `query` or `parameters`.
+- Don't copy the dead `if (!users)` check from `user.service.ts:60-62`.
 
-## TDD workflow
-For each cycle: **Red** — write the tests and run them to confirm they fail for the expected reason (not a compile error elsewhere), then commit `test(<scope>): ...`. **Green** — make the smallest change that passes them, then commit `fix(<scope>): ...`. **Refactor** — clean up with the tests still green. Run `npm test` (and `npm run test:e2e` where listed) at every Red and Green step.
+## Files
 
-### Cycle 0: Harness (no behaviour change)
-1. `npm i class-validator` (`class-transformer` is already installed).
-2. `test/jest-e2e.json`: add `moduleNameMapper` (G8).
-3. Replace the `GET /` test in `test/app.e2e-spec.ts` with a `test/auth-user.e2e-spec.ts` skeleton:
-   - `beforeAll`: build the app from `AppModule`, get the `DataSource`, and create an admin (register, then flip `isAdmin` via the DataSource) (G9).
-   - `afterAll`: delete the test users and call `app.close()` (G11).
-   - Shared helpers: `register()`, `login()`, `authed()`.
-4. Green check: `npm run test:e2e` runs (an empty or skeleton suite passes). Commit `test(e2e): fix harness and add auth/user suite skeleton`.
+### Modify
+- [src/user/dto/create-user.dto.ts:13-21](src/user/dto/create-user.dto.ts#L13-L21): move `trim`, `NO_NUL` and `NO_NUL_OPTIONS` (and their G21 comment) to a new `src/common/string-validation.ts`, and import them from there. No behaviour change.
+- [src/types/index.ts](src/types/index.ts): add `Genre` after line 4.
+- [src/app.module.ts](src/app.module.ts):
+  - Line 7: import `Movie` and `MovieModule`.
+  - Line 25: `entities: [User, Movie]`.
+  - Line 30: add `MovieModule` after `UserModule`.
+- [src/pipes/parse-id.pipe.ts:9](src/pipes/parse-id.pipe.ts#L9): the comment should say the limit is the column type of every serial `id`, not just `user.id`.
+- [CLAUDE.md](CLAUDE.md), Architecture block: add `common/` and `movie/` to the tree, and note the pattern of `@Public()` reads with `@Roles(Role.ADMIN)` writes.
 
-### Cycle 1: Validation & no self-promotion (finding 1, G1, G2, G3)
-**Red**
-- New `src/user/dto/create-user.dto.spec.ts`, using `plainToInstance` + `validate`:
-  - Rejects a bad email, empty or whitespace-only names, and passwords shorter than 8 or longer than 72 characters.
-  - Trims surrounding whitespace from names.
-  - Accepts optional `isAdmin`, but rejects `isAdmin: null` (G14).
-  - Lowercases and trims the email.
-- New `src/auth/dto/register.dto.spec.ts`: `isAdmin` is not a known property. With `forbidNonWhitelisted`, validation errors on it.
-- New `src/user/dto/update-user.dto.spec.ts`: `plainToInstance(UpdateUserDto, {password: 'x'.repeat(8)})` has **no `isAdmin` key** (G1). All fields are optional, but an explicit `null` on any field is rejected (G14).
-- `src/auth/auth.service.spec.ts`: `signUp` calls `usersService.create` with `isAdmin: false`, even when the input contains `isAdmin: true`.
-- `src/app.controller.spec.ts`: `register(dto)` passes the DTO to `signUp`.
-- E2E:
-  - Register with `isAdmin: true` → 400, and no row is created.
-  - Register with an invalid email or short password → 400.
-  - Register valid → 201, `isAdmin: false`, no `password` in the body.
-  - Login with an empty body → 401 (G12).
+### Add
+- `src/common/string-validation.ts`
+- `src/movie/`:
+  - `movie.module.ts`: `forFeature([Movie])`, `exports: [MovieService]`.
+  - `movie.controller.ts`, `movie.service.ts`, `entities/movie.entity.ts`.
+  - `dto/create-movie.dto.ts`, `dto/update-movie.dto.ts`, `dto/find-movies-query.dto.ts`.
+- Specs:
+  - `src/movie/movie.service.spec.ts`, `src/movie/movie.controller.spec.ts`.
+  - `src/movie/dto/*.dto.spec.ts` (one per DTO).
+  - `test/movie.e2e-spec.ts`.
 
-**Green**
-- Add validators to `src/user/dto/create-user.dto.ts` and remove its `= false` initializer.
-- Add `src/auth/dto/register.dto.ts`.
-- Add `APP_PIPE` in `src/app.module.ts`.
-- `src/app.controller.ts`: `@Body() dto: RegisterDto`.
-- `src/auth/auth.service.ts`: `signUp(dto: RegisterDto)` forces `isAdmin: false`.
-- `src/user/dto/update-user.dto.ts`: `PartialType(CreateUserDto, { skipNullProperties: false })`; `CreateUserDto.isAdmin` uses `@ValidateIf((_, v) => v !== undefined)` instead of `@IsOptional()` (G14).
+## Acceptance criteria
 
-**Known interim gap (Cycles 1–3), resolved in Cycle 3:** after Cycle 1, emails are stored lowercased, but `validateUser` still looks them up as typed until Cycle 3. A user registered as `Foo@Bar.dev` (stored `foo@bar.dev`) who logs in with `Foo@Bar.dev` gets a 404 until then. Cycle 1 must not be merged or deployed without Cycle 3; state this in the PR Test Plan.
+### Unit (`npm test`)
+- **Refactor guard:** the existing `create-user.dto.spec.ts`, `update-user.dto.spec.ts` and `register.dto.spec.ts` pass **unchanged**.
+- **`create-movie.dto.spec.ts`:**
+  - Boundaries pass and fail exactly at the limits: title 200/201, description 5000/5001, duration 1/600 vs 0/601/90.5/`'120'`.
+  - The `releaseDate` cases above.
+  - `posterUrl`: `http://`, no protocol, `javascript:`, and 2049 characters all fail; omitted or `null` passes.
+  - Trims names; rejects NUL.
+  - Every `Genre` value passes; `'Action'` fails.
+- **`update-movie.dto.spec.ts`:**
+  - `{ title: 'x' }` transforms to an object with only `title`.
+  - `null` fails on every field except `posterUrl`.
+  - `{}` passes; the service rejects it, not the DTO.
+- **`find-movies-query.dto.spec.ts`:** `{}` and `{ genre: 'drama' }` pass; `'nope'`, `''` and `['drama','comedy']` fail.
+- **`movie.service.spec.ts`:**
+  - Exact `find` arguments, with and without `genre`.
+  - The 404 message.
+  - `update({})` makes no repository calls.
+  - `update` returns the second `findOneBy` result.
+  - `23505` and other DB errors become 500 without DB text in the message, and the log has no `query`/`parameters`.
+  - `HttpException` passthrough.
+- **`movie.controller.spec.ts`:**
+  - `findOne`/`update`/`remove` use `@IdParam` with `ParseIdPipe`. Same approach as `user.controller.spec.ts:57-95`.
+  - `ROLES_KEY = [Role.ADMIN]` on `create`/`update`/`remove` only.
+  - `IS_PUBLIC_KEY` on `findAll`/`findOne` only.
+  - Each method passes its exact arguments to the service.
 
-### Cycle 2: Hash on every write path (finding 2)
-**Red**
-- `src/user/user.service.spec.ts`: provide a `ConfigService` mock and mock `bcrypt`. Tests:
-  - `create` saves the hashed password, never the plaintext.
-  - `update` hashes `password` when present and doesn't call `bcrypt.hash` when absent.
-  - A present-but-empty password (`''` or `null`, from a non-HTTP caller) is rejected with `BadRequestException('password must not be empty')` before any DB call or hashing. Added after the final review.
-- `src/auth/auth.service.spec.ts`: `signUp` passes the plaintext password to `create` and doesn't call `bcrypt.hash` itself.
-- E2E:
-  - As admin, `POST /user` → the new user can log in. A DB read of that row shows `password` starting with `$2b$`.
-  - As admin, `PATCH /user/:id {password}` → login with the new password succeeds and the user is still an admin if they were one (G1).
+### E2E (`npm run test:e2e`, `test/movie.e2e-spec.ts`)
+- **Harness:** same as `test/auth-user.e2e-spec.ts:75-97`.
+  - Prefix `e2e-movie-${Date.now()}-` on emails and titles, so it can't clash with the auth suite's cleanup.
+  - Seed an admin via the `DataSource` (G9).
+  - `afterAll` deletes the prefixed movies and users, then closes the app.
+- **Public reads:**
+  - `GET /movie` and `GET /movie/:id` without a token give 200.
+  - `releaseDate` comes back exactly `YYYY-MM-DD`.
+  - `posterUrl` is `null` when it was omitted.
+- **Filter and order:** check against this run's own rows only.
+  - `?genre=horror` includes this run's horror movie and excludes its comedy movie.
+  - Title `…A` sorts before `…B`.
+- **400 cases:**
+  - Bad query: `?genre=nope`, a repeated genre, `?foo=1`.
+  - Bad ids: `abc`, `0x10`, `0`, `2147483648`.
+  - Invalid bodies: `id` in the body, `'120'` duration, `2021-02-29`, `http:` poster, a 201-character title, a NUL in the title. No row is created for any of these.
+  - `PATCH` with `{}`, `{ title: null }` or an invalid genre.
+- **404 cases:** `GET`, `PATCH` and `DELETE` on a deleted id; a second `DELETE`.
+- **Auth:** `POST`, `PATCH` and `DELETE` give 401 without a token and 403 for a non-admin, and the DB row is unchanged.
+- **Writes:**
+  - `POST` gives 201 with trimmed strings.
+  - Posting the same body twice gives two different ids.
+  - `PATCH { durationMinutes: 150 }` changes only that field.
+  - `PATCH { posterUrl: null }` clears it in the DB.
+  - After `DELETE`, a `GET` gives 404.
+- **Logging:** `spyOnAllLogging()` records nothing across a successful `POST` → `PATCH` → `DELETE`.
 
-**Green**
-- `src/user/user.service.ts`: inject `ConfigService` and add `hashPassword()`; use it in `create` and `update`.
-  - Validate `JWT_SALT_OR_ROUNDS` once in the constructor (G16).
-  - In `update`, a `password` key that is present but not a non-empty string (`''` or `null`) gets 400 `password must not be empty`. That check runs after the "No fields to update" guard and before `findOne`; otherwise the password is hashed.
-    - The DTO already rejects both over HTTP (`@MinLength(8)`, `skipNullProperties: false`); this guards non-HTTP callers.
-    - Neither alternative works. Silently dropping the field turned `{password: ''}` into an empty update, so a 500 (G4), and ignored a requested password change. Hashing `''` stored a valid hash of an empty password.
-- `src/auth/auth.service.ts`: remove `saltOrRounds` and the hashing. The `ConfigService` constructor parameter stays for now (see the Cycle 3 note).
+### Manual (`npm run start:dev`)
+- **Setup:**
+  - Register `admin@local.dev`.
+  - Promote it with `docker exec postgres_db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "UPDATE \"user\" SET \"isAdmin\"=true WHERE email='"'"'admin@local.dev'"'"'"'`.
+  - Log in and keep the token as `$ADMIN`.
+- **Checks:**
+  - `POST /movie` as admin with `"title":"  Arrival "` gives 201, `"title":"Arrival"`, `"posterUrl":null`.
+  - The same request without a token gives 401, and with a user token gives 403.
+  - `GET /movie` without a token gives 200 and includes Arrival.
+  - `?genre=sci-fi` gives 200, filtered; `?genre=western` gives 400.
+  - `GET /movie/abc` gives 400, and `/movie/999999` gives 404.
+  - `PATCH {"posterUrl":null}` gives 200 with null.
+  - `PATCH {}` gives 400, and `{"releaseDate":"2021-02-29"}` gives 400.
+  - `DELETE` gives 200, then `GET` gives 404.
+  - `\d movie` in psql shows `varchar(200)`, `movie_genre_enum`, `date`, and a nullable `varchar(2048)`.
+  - The server console shows no stack traces, bodies or tokens.
 
-**Review-driven test hardening:**
-- Input-dependent `bcrypt.hash` stub, so double hashing is caught.
-- Exact `repo.update` payloads.
-- Frozen DTOs, so in-place mutation is caught.
-- `jest.resetAllMocks()` in `beforeEach`.
-- `auth.service.spec.ts` built with `Test.createTestingModule`.
-- E2E: a hash check after PATCH, the G1 precondition, and no `password` in the `POST /user` response.
-
-### Cycle 3: Login 401 for unknown email (finding 3, G7)
-**Red**
-- `src/user/user.service.spec.ts`: `findOneByEmail` resolves `null` when the user is missing.
-- `src/auth/auth.service.spec.ts`:
-  - `validateUser` returns `null` for an unknown email **and still calls `bcrypt.compare`** (dummy hash).
-  - The dummy hash must use the same salt rounds as real hashes. **Decision:** `UserService.hashPassword` becomes public and is the one source of salt rounds (G16). `AuthService` builds the dummy hash from it once, caching the promise per instance, and never re-reads `JWT_SALT_OR_ROUNDS`. `AuthService` drops its unused `ConfigService` parameter.
-  - The dummy hash is started once at startup (`onModuleInit`) and reused. Without init it is computed lazily, once, even under concurrent logins, and not at all for known users. A rejected hash is retried, never cached, and a failure at startup doesn't throw.
-  - It trims and lowercases the email before the lookup.
-  - A non-string `username` or `password` returns `null` (401) before any lookup. Login bypasses the ValidationPipe, and `.trim()` / `bcrypt.compare` would otherwise throw a 500 (found in review).
-- E2E:
-  - Login with an unknown email and with a wrong password both return 401 with identical bodies (`{ statusCode: 401, message: 'Unauthorized' }`).
-  - Login with a differently cased and padded email succeeds. This closes the Cycle 1–3 interim gap.
-  - A non-string `username` or `password` returns 401.
-
-**Green**
-- `src/user/user.service.ts`: `findOneByEmail` returns `Promise<User | null>`, and `hashPassword` is public.
-- `src/auth/auth.service.ts`:
-  - Normalise the email.
-  - Dummy-hash compare when the user is missing, using the cached `usersService.hashPassword(<random>)`.
-    - The cache is cleared on rejection.
-    - It is warmed in `onModuleInit` without being awaited, and errors there are swallowed.
-  - Return `null` early for non-string credentials.
-  - Remove the `ConfigService` constructor parameter.
-
-### Cycle 4: Status codes & return values (finding 4, G4, G5, G6)
-**Red**
-- `src/user/user.service.spec.ts`:
-  - `create` and `update` map a `QueryFailedError` with code `23505` → `ConflictException`, and a generic error → `InternalServerErrorException`, whose message doesn't contain the DB error text.
-  - `update` returns the reloaded `User`, throws `NotFoundException` for an unknown id, and throws `BadRequestException` for an empty DTO.
-  - `remove` throws `NotFoundException` / `InternalServerErrorException`.
-- `src/auth/auth.service.spec.ts`: `signUp` propagates `ConflictException` unchanged.
-- `src/user/user.controller.spec.ts`: methods take numeric ids (`findOne(1)`, `update(1, dto)`, `remove(2)`).
-- E2E:
-  - Duplicate register (including a different email case) → 409.
-  - PATCH to an existing email → 409.
-  - `GET /user/abc` → 400.
-  - `PATCH /user/:id` returns the user without `password`.
-  - `PATCH {}` → 400.
-
-**Decisions:**
-- **Empty `PATCH`.** A body with no defined fields gets `BadRequestException('No fields to update')` before any DB call or hashing. That's cheaper and doesn't depend on the user existing.
-- **500 logging.** It goes through `Logger` with the error's name, message and stack only, never TypeORM's `query`/`parameters` (they hold the email and the password hash). The response message is generic: `Failed to <create|update|remove> user`.
-- **HTTP exceptions** (e.g. `NotFoundException`) pass through the mapping unchanged.
-- **`signUp`.** Loses both its try/catch and its `if (!payload)` bare `Error`; the ValidationPipe guarantees a body. `UserService` errors propagate unchanged, so the old "throw an error for an invalid user" test is replaced by propagation tests.
-- **`findAll`'s dead `!users` check** stays; it's dead code (finding 10), out of scope.
-
-**Green**
-- `src/user/user.service.ts`: error mapping, `await` inside `try`, return `findOne(id)`, empty-DTO guard, `Logger` for 500s, and remove the dead `if (!user)` checks.
-- `src/auth/auth.service.ts`: remove the try/catch in `signUp`.
-- `src/user/user.controller.ts`: `ParseIdPipe` (new `src/pipes/parse-id.pipe.ts`, G17).
-- `toHttpError` returns `HttpException`, and non-`Error` throws are normalised before logging.
-
-**Review-driven test hardening:**
-- HTTP-exception passthrough.
-- A falsy-but-defined PATCH (`{ isAdmin: false }`).
-- 23505 vs. other codes, matched by code rather than message.
-- Log content and the absence of the query.
-- Hash and DB failures on update.
-- A plain `Error` propagating through `signUp`.
-- Recased `POST /user` 409.
-- Exact `ParseIdPipe` messages (the delegated numeric message and the range message), and e2e id-range cases.
-
-### Cycle 5: Remove sensitive logging (finding 6)
-**Red**
-- `src/auth/jwt.strategy.spec.ts` (new):
-  - `validate` maps admin and non-admin payloads exactly (`isAdmin: false` catches a hard-coded admin flag).
-  - `JWT_SECRET` is read with `getOrThrow`.
-  - Nothing is logged.
-- `src/auth/role.guard.spec.ts` (new):
-  - Admin is allowed and non-admin is denied on `@Roles(ADMIN)`; a non-admin is allowed on `@Roles(USER)`.
-  - No `@Roles` → allowed.
-  - Nothing is logged.
-- E2E: an authenticated admin `GET /user` and `PATCH /user/:id` log nothing.
-- **"Nothing is logged"** means no call on any `console` method or Nest `Logger` method. It uses a shared helper, `test/utils/spy-on-logging.ts`, added after review because a `console.log`-only spy missed other channels.
-
-**Green**
-- Delete the `console.log` lines in `src/auth/jwt.strategy.ts` and `src/auth/role.guard.ts`.
-
-**Follow-ups found in review (not this cycle):**
-- `RolesGuard` throws a 500 if `user` is missing on a `@Roles` route. That's unreachable today, because the global `JwtAuthGuard` runs first. Use `user?.isAdmin`, and deny.
-- An admin is denied on a `@Roles(Role.USER)` route, and an empty `@Roles()` denies everyone. Decide the intended behaviour before any route uses `Role.USER`.
-
-### Final refactor
-- Run `npm run format` and `npx eslint "{src,apps,libs,test}/**/*.ts"`.
-- Update CLAUDE.md and commit it. It was untracked before this branch; it was committed in `7f3f21d`.
-  - The Architecture notes on global validation (including `src/validation-pipe.options.ts`), `RegisterDto`, `src/pipes/` and where hashing lives.
-  - The env table: `JWT_SALT_OR_ROUNDS` is read by `UserService`, must be an integer 10–15, and stops startup otherwise.
-  - The Testing section: `jest.resetAllMocks()` plus re-stubbing replaces `clearAllMocks` in every spec. The two controller specs were aligned after the full-branch review.
-
-## Files touched (summary)
-- **Modified:**
-  - `package.json`, `package-lock.json`
-  - `test/jest-e2e.json`
-  - `src/app.module.ts`, `src/app.controller.ts`
-  - `src/auth/auth.service.ts`, `src/auth/jwt.strategy.ts`, `src/auth/role.guard.ts`
-  - `src/user/user.service.ts`, `src/user/user.controller.ts`, `src/user/dto/create-user.dto.ts`, `src/user/dto/update-user.dto.ts`
-  - Existing specs: `auth.service`, `user.service`, `user.controller`, `app.controller`
-- **New:**
-  - `SPEC.md` (this file)
-  - `CLAUDE.md` (previously untracked; committed with the final refactor)
-  - `src/auth/dto/register.dto.ts`
-  - `src/validation-pipe.options.ts` and `src/validation-pipe.options.spec.ts`
-  - `src/pipes/parse-id.pipe.ts` and `src/pipes/parse-id.pipe.spec.ts`
-  - `src/decorators/id-param.decorator.ts` (full-branch review, G17)
-  - DTO specs ×3
-  - `src/auth/jwt.strategy.spec.ts`, `src/auth/role.guard.spec.ts`
-  - `test/auth-user.e2e-spec.ts` and `test/utils/spy-on-logging.ts`
-- **Removed:** `test/app.e2e-spec.ts`, replaced by the new suite.
-
-## Definition of done
-1. `POST /auth/register` with `isAdmin` in the body returns **400**, and no row is created.
-2. All users created via register, `POST /user` or `PATCH /user/:id` have bcrypt hashes (`$2b$...`) in `user.password`. `PATCH` with only `password` doesn't change `isAdmin`.
-3. Login with an unknown email returns **401**, with a body identical to a wrong-password attempt.
-4. The following all hold:
-   - A duplicate email (case-insensitive) returns **409** on register, `POST /user` and `PATCH`.
-   - A non-numeric `:id` returns **400**, and so does an empty PATCH body.
-   - `PATCH` returns the updated user without `password`.
-   - No 500 response body contains DB error text.
-   - `grep -rn --exclude='*.spec.ts' "new Error(" src` matches only the G16 startup config check in `user.service.ts` (tests construct errors legitimately).
-5. `grep -rn "console.log" src` is empty (the specs use spy variables), and `grep -rn --exclude='*.spec.ts' "console\." src` is empty.
-6. Every cycle has a `test:` commit that failed before its `fix:` commit. All of the following pass:
-   - `npx eslint "{src,apps,libs,test}/**/*.ts"`
-   - `npm test`
-   - `npm run build`
-   - `npm run test:e2e` (local DB)
-7. Follow-ups are recorded as issues: admin bootstrap (G9), rehash/audit/email-lowercasing of existing data (G10), e2e in CI (G13), logging on unwrapped read paths (G19), register email enumeration (G20), and the two `RolesGuard` follow-ups from Cycle 5 (missing user, admin on `Role.USER` routes). List them in the PR description.
-
-## Verification
-1. Per cycle: `npm test -- <pattern>` fails at Red and passes at Green. Capture both outputs in the PR Test Plan.
-2. Final: `npx eslint "{src,apps,libs,test}/**/*.ts"` → `npm test` → `npm run build` → `docker compose up -d && npm run test:e2e`.
-3. Manual smoke test with `npm run start:dev` and curl:
-   - Register with `isAdmin` → 400.
-   - Register → 201.
-   - Register the same email in a different case → 409.
-   - Login with an unknown email → 401.
-   - `GET /user/abc` with a token → 400.
-   - The server console shows no JWT payloads or user objects.
+### Definition of done
+- `npx eslint "{src,apps,libs,test}/**/*.ts"`, `npm test`, `npm run build` and `npm run test:e2e` pass. Node 24 per `.nvmrc`.
+- No input listed above gives a 500.
+- The greps:
+  - `grep -rn "console\." src/movie src/common` is empty.
+  - `NO_NUL = ` appears only in `src/common/string-validation.ts`.
+- `git diff main -- src/user src/auth` shows only the import swap in `create-user.dto.ts`.
+- The PR lists the out-of-scope items as follow-ups.
