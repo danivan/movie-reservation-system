@@ -320,6 +320,16 @@ describe('MovieService', () => {
       });
     });
 
+    // toHaveBeenCalledWith ignores key order, which decides the sort.
+    it('should order by title before id', async () => {
+      await service.findAll({});
+
+      const [options] = mockMovieRepository.find.mock.calls[0] as [
+        { order: object },
+      ];
+      expect(Object.keys(options.order)).toEqual(['title', 'id']);
+    });
+
     it('should return the movies in the order the repository returns them', async () => {
       mockMovieRepository.find.mockResolvedValue([
         makeMovie({ id: 2, title: 'Alien' }),
@@ -420,12 +430,19 @@ describe('MovieService', () => {
     });
 
     it('should return the movie reloaded after the update (second findOneBy result)', async () => {
+      // durationMinutes differs from the first result and is not in the dto,
+      // so a merge of the first result with the dto can't match it.
+      const reloaded = makeMovie({
+        id: 1,
+        title: 'After',
+        durationMinutes: 999,
+      });
       mockMovieRepository.findOneBy
         .mockResolvedValueOnce(makeMovie({ id: 1, title: 'Before' }))
-        .mockResolvedValueOnce(makeMovie({ id: 1, title: 'After' }));
+        .mockResolvedValueOnce(reloaded);
 
-      await expect(service.update(1, { title: 'After' })).resolves.toEqual(
-        makeMovie({ id: 1, title: 'After' }),
+      await expect(service.update(1, { title: 'After' })).resolves.toBe(
+        reloaded,
       );
       expect(mockMovieRepository.findOneBy).toHaveBeenNthCalledWith(2, {
         id: 1,

@@ -76,6 +76,7 @@
   - Line 25: `entities: [User, Movie]`.
   - Line 30: add `MovieModule` after `UserModule`.
 - [src/pipes/parse-id.pipe.ts:9](src/pipes/parse-id.pipe.ts#L9): the comment should say the limit is the column type of every serial `id`, not just `user.id`.
+- [package.json](package.json): add `--runInBand` to `test:e2e`. Both e2e suites boot `AppModule` with `synchronize: true`, and on a cold DB they raced to create the `movie` table and enum.
 - [CLAUDE.md](CLAUDE.md), Architecture block: add `common/` and `movie/` to the tree, and note the pattern of `@Public()` reads with `@Roles(Role.ADMIN)` writes.
 
 ### Add

@@ -14,8 +14,9 @@ import { spyOnAllLogging } from './utils/spy-on-logging';
 // differs from the auth suite's `e2e-<ts>-`, so neither cleanup touches the
 // other's rows.
 const RUN_PREFIX = `e2e-movie-${Date.now()}-`;
-const PASSWORD = 'password123';
-// Fresh per run, so the seeded admin's credentials are never guessable.
+// Fresh per run (24 hex chars, within the 8-72 limit), so leftover accounts
+// from a killed run never have guessable credentials.
+const PASSWORD = randomBytes(12).toString('hex');
 const ADMIN_PASSWORD = randomBytes(12).toString('hex');
 let emailSeq = 0;
 const uniqueEmail = () => `${RUN_PREFIX}${emailSeq++}@test.dev`;
@@ -365,6 +366,21 @@ describe('Movie (e2e)', () => {
       const res = await createMovie(makeMovieBody({ title })).expect(201);
 
       expect(res.body.title).toBe(title);
+    });
+
+    it('should store a 5000-character description and a 2048-character https posterUrl with 201', async () => {
+      const description = 'x'.repeat(5000);
+      const posterUrl = 'https://example.com/' + 'a'.repeat(2028);
+      expect(posterUrl.length).toBe(2048);
+
+      const res = await createMovie(
+        makeMovieBody({ title: uniqueTitle(), description, posterUrl }),
+      ).expect(201);
+
+      expect(res.body).toMatchObject({ description, posterUrl });
+      const row = await movies().findOneByOrFail({ id: res.body.id });
+      expect(row.description).toBe(description);
+      expect(row.posterUrl).toBe(posterUrl);
     });
 
     it('should create two movies with different ids for the same body', async () => {
